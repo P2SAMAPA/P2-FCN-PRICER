@@ -9,7 +9,7 @@ from datetime import datetime
 def fetch_stock_data(tickers, lookback_years=5):
     end_date = datetime.now()
     start_date = end_date - pd.Timedelta(days=lookback_years * 365 + 60)  # buffer
-    data = yf.download(tickers, start=start_date, end=end_date, progress=False)['Adj Close']
+    data = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close']
     if data.empty:
         raise ValueError("No data downloaded – check tickers or internet.")
     log_returns = np.log(data / data.shift(1)).dropna()
