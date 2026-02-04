@@ -204,6 +204,10 @@ with st.form("inputs"):
     iv_maturity_days = st.number_input("Implied vol maturity days (ATM IV, e.g. 30)", min_value=7, max_value=365, value=30, step=7)
 
     use_implied_vol = st.checkbox("Use Implied Volatility (from options chain)", value=True)
+    
+    if not use_implied_vol:
+        st.info("☞ Implied volatility is turned **OFF** → the pricer is using **historical volatility** based on the lookback period returns.")
+
     skew_factor = st.slider("Volatility skew adjustment factor (1.0 = neutral)", 0.70, 1.50, 1.00, 0.05)
     equicorr_override = st.slider("Equicorrelation override (0 = use historical corr)", 0.0, 1.0, 0.0, 0.05)
 
