@@ -6,7 +6,7 @@ from scipy.linalg import cholesky
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
-@st.cache_data(ttl=1800)  # shorter cache for options data freshness
+@st.cache_data(ttl=1800)
 def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
     end_date = datetime.now()
     start_date_hist = end_date - pd.Timedelta(days=lookback_months * 30 + 60)
@@ -18,14 +18,14 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
     hist_vols = log_returns.std() * np.sqrt(252)
     corr_matrix_hist = log_returns.corr()
 
-    # Implied vols
-    vols = pd.Series(index=tickers, dtype=float)
+    # Implied vols (only fetched when needed)
+    implied_vols = pd.Series(index=tickers, dtype=float)
     for ticker in tickers:
         try:
             stock = yf.Ticker(ticker)
             expirations = stock.options
             if not expirations:
-                vols[ticker] = hist_vols[ticker]
+                implied_vols[ticker] = hist_vols[ticker]
                 continue
 
             target_date = end_date + timedelta(days=iv_maturity_days)
@@ -34,11 +34,9 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
             calls, puts = opt_chain.calls, opt_chain.puts
 
             current_price = stock.history(period='1d')['Close'].iloc[-1]
-            # ATM strike (closest to spot)
             atm_strike_call = calls.iloc[(calls['strike'] - current_price).abs().argmin()]['strike']
             atm_strike_put = puts.iloc[(puts['strike'] - current_price).abs().argmin()]['strike']
 
-            # Prefer call IV if available, average with put if both exist
             call_iv = calls[calls['strike'] == atm_strike_call]['impliedVolatility'].values
             put_iv = puts[puts['strike'] == atm_strike_put]['impliedVolatility'].values
 
@@ -48,9 +46,9 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
             if len(put_iv) > 0 and not np.isnan(put_iv[0]):
                 ivs.append(put_iv[0])
 
-            vols[ticker] = np.mean(ivs) if ivs else hist_vols[ticker]
+            implied_vols[ticker] = np.mean(ivs) if ivs else hist_vols[ticker]
         except Exception:
-            vols[ticker] = hist_vols[ticker]
+            implied_vols[ticker] = hist_vols[ticker]
 
     dividends = {}
     for ticker in tickers:
@@ -60,10 +58,19 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
         except:
             dividends[ticker] = 0.0
 
-    return vols, corr_matrix_hist, dividends
+    return hist_vols, implied_vols, corr_matrix_hist, dividends
 
-def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback_months=60, iv_maturity_days=30, equicorr_override=0.0):
-    vols, corr_hist, dividends = fetch_stock_data(tickers, lookback_months, iv_maturity_days)
+def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000,
+              lookback_months=60, iv_maturity_days=30, use_implied_vol=False,
+              skew_factor=1.0, equicorr_override=0.0):
+    
+    hist_vols, implied_vols, corr_hist, dividends = fetch_stock_data(tickers, lookback_months, iv_maturity_days)
+
+    # Choose vol source
+    vols = implied_vols if use_implied_vol else hist_vols
+
+    # Apply skew adjustment (simple scalar multiplier)
+    vols = vols * skew_factor
 
     num_stocks = len(tickers)
     num_periods = int(T * freq)
@@ -73,7 +80,6 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
 
     # Correlation logic
     if equicorr_override > 0.0001:
-        # Uniform correlation matrix
         corr_matrix = np.full((num_stocks, num_stocks), equicorr_override)
         np.fill_diagonal(corr_matrix, 1.0)
     else:
@@ -83,7 +89,7 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
     try:
         chol_matrix = cholesky(cov_matrix, lower=True)
     except:
-        raise ValueError("Cov matrix invalid (not positive semi-definite). Try lower equicorr or more lookback.")
+        raise ValueError("Covariance matrix not positive semi-definite. Try lower equicorr or different vols.")
 
     drifts = rf - np.array([dividends.get(t, 0.0) for t in tickers]) - 0.5 * vol_vector**2
 
@@ -175,13 +181,15 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
         'prob_put_hit': prob_put_hit,
         'expected_coupons': expected_coupons,
         'avg_loss_severity': avg_loss_severity,
-        'fig': fig
+        'fig': fig,
+        'vol_source': "Implied" if use_implied_vol else "Historical",
+        'skew_factor': skew_factor
     }
     return results
 
 # ────────────────────────────────────────────────
-st.title("Fixed Coupon Note (Autocallable Worst-of) Pricer – Implied Vol + Corr Override")
-st.caption("Monte Carlo GBM – indication only, not advice. Implied vols from options; corr historical or equicorr override.")
+st.title("Fixed Coupon Note (Autocallable Worst-of) Pricer")
+st.caption("Monte Carlo GBM – indication only, not financial advice")
 
 with st.form("inputs"):
     tickers_str = st.text_input("Basket tickers (comma-separated, e.g. AAPL,MSFT,NVDA)", "AAPL,MSFT,NVDA")
@@ -192,16 +200,19 @@ with st.form("inputs"):
     put_strike = st.number_input("Put strike (e.g. 0.70 = 70%)", min_value=0.3, max_value=1.0, value=0.70, step=0.05)
     rf = st.number_input("Risk-free rate (e.g. 0.045 = 4.5%)", min_value=0.0, max_value=0.10, value=0.045, step=0.005)
     sims = st.number_input("Monte Carlo simulations (10000 recommended)", min_value=1000, max_value=100000, value=10000, step=1000)
-    lookback_months = st.number_input("Lookback months for correlation & fallback vol (e.g. 60 = 5 years)", min_value=1, max_value=120, value=60, step=1)
-    iv_maturity_days = st.number_input("Implied vol maturity days (ATM IV fetch, e.g. 30)", min_value=7, max_value=365, value=30, step=7)
-    equicorr_override = st.slider("Equicorrelation override (0 = use historical corr, 0.5 = assume 50% uniform corr)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
-    
+    lookback_months = st.number_input("Lookback months for correlation & historical vol (e.g. 60)", min_value=1, max_value=120, value=60, step=1)
+    iv_maturity_days = st.number_input("Implied vol maturity days (ATM IV, e.g. 30)", min_value=7, max_value=365, value=30, step=7)
+
+    use_implied_vol = st.checkbox("Use Implied Volatility (from options chain)", value=True)
+    skew_factor = st.slider("Volatility skew adjustment factor (1.0 = neutral)", 0.70, 1.50, 1.00, 0.05)
+    equicorr_override = st.slider("Equicorrelation override (0 = use historical corr)", 0.0, 1.0, 0.0, 0.05)
+
     col1, col2 = st.columns(2)
     with col1:
         show_sensitivity = st.checkbox("Show sensitivity table", value=True)
     with col2:
         sensitivity_param = st.radio("Vary parameter", ["KO barrier", "Put strike"], horizontal=True, disabled=not show_sensitivity)
-    
+
     submitted = st.form_submit_button("Calculate", use_container_width=True)
 
 if submitted:
@@ -209,11 +220,19 @@ if submitted:
     if not tickers:
         st.error("Enter at least one ticker.")
     else:
-        with st.spinner("Fetching data & running Monte Carlo..."):
+        with st.spinner("Fetching market data & running Monte Carlo..."):
             try:
-                main_results = price_fcn(tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf, sims, lookback_months, iv_maturity_days, equicorr_override)
-                
+                main_results = price_fcn(
+                    tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
+                    sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override
+                )
+
+                vol_label = main_results['vol_source']
+                if skew_factor != 1.0:
+                    vol_label += f" × {skew_factor:.2f} (skew adj)"
+
                 st.success(f"Implied Annualized Yield p.a.: **{main_results['yield_pa']*100:.2f}%**")
+                st.write(f"Vol used: **{vol_label}**")
                 st.write(f"• Probability of Autocall: **{main_results['prob_autocall']*100:.2f}%**")
                 st.write(f"• Probability of Survival to Maturity: **{main_results['prob_survival']*100:.2f}%**")
                 st.write(f"• Probability of Capital Loss (Put hit): **{main_results['prob_put_hit']*100:.2f}%**")
@@ -227,7 +246,7 @@ if submitted:
 
                 if show_sensitivity:
                     st.subheader("Sensitivity Analysis")
-                    with st.spinner("Calculating sensitivity table (10 levels, 5% steps, centered on input)"):
+                    with st.spinner("Calculating sensitivity table..."):
                         if sensitivity_param == "KO barrier":
                             base = ko_barrier
                             step = 0.05
@@ -244,9 +263,17 @@ if submitted:
                         table_data = []
                         for level in levels:
                             if sensitivity_param == "KO barrier":
-                                res = price_fcn(tickers, tenor, freq, non_call_periods, level, put_strike, rf, max(3000, sims // 3), lookback_months, iv_maturity_days, equicorr_override)
+                                res = price_fcn(
+                                    tickers, tenor, freq, non_call_periods, level, put_strike, rf,
+                                    max(3000, sims // 3), lookback_months, iv_maturity_days,
+                                    use_implied_vol, skew_factor, equicorr_override
+                                )
                             else:
-                                res = price_fcn(tickers, tenor, freq, non_call_periods, ko_barrier, level, rf, max(3000, sims // 3), lookback_months, iv_maturity_days, equicorr_override)
+                                res = price_fcn(
+                                    tickers, tenor, freq, non_call_periods, ko_barrier, level, rf,
+                                    max(3000, sims // 3), lookback_months, iv_maturity_days,
+                                    use_implied_vol, skew_factor, equicorr_override
+                                )
 
                             table_data.append({
                                 param_name: f"{level:.0%}",
@@ -265,7 +292,7 @@ if submitted:
                         st.table(df.style.apply(highlight_middle, axis=1))
 
             except Exception as e:
-                st.error(f"Error: {str(e)}. Try fewer sims, different tickers, or check internet.")
+                st.error(f"Error: {str(e)}\n\nTry fewer simulations, valid tickers, or shorter lookback.")
 
 st.markdown("---")
-st.caption("Uses implied ATM vols from options chains where available (fallback historical). Correlation: historical or equicorrelation override. GBM Monte Carlo. Real-time Yahoo data. Indication only.")
+st.caption("Worst-of Autocallable Fixed Coupon Note • European barriers • GBM • Yahoo Finance data • Implied vol option (ATM) • Simple skew scalar • Equicorr override")
