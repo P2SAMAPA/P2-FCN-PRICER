@@ -63,7 +63,7 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
     worst_paths_viz[:, 0] = 1.0
     
     autocall_count = 0
-    put_hit_count = 0  # NEW: count sims where put is hit at maturity
+    put_hit_count = 0
     
     for sim in range(n_sims):
         normals = np.random.normal(size=(num_periods, num_stocks))
@@ -86,7 +86,7 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
         
         if not terminated:
             worst = np.min(full_paths[-1])
-            if worst < strike:  # NEW
+            if worst < strike:
                 put_hit_count += 1
             redemption = 1.0 if worst >= strike else worst
         else:
@@ -143,26 +143,53 @@ st.title("Fixed Coupon Note (Autocallable Worst-of) Pricer")
 st.caption("Monte Carlo GBM – indication only, not advice.")
 
 with st.form("inputs"):
-    tickers_str = st.text_input("Basket tickers", "AAPL,MSFT,NVDA")
-    tenor = st.number_input("Tenor years", 0.5, 10.0, 3.0, 0.5)
-    freq = st.number_input("Coupons/year", 1, 12, 4)
-    non_call_periods = st.number_input("Non-call periods", 0, 20, 4)
-    ko_barrier = st.number_input("KO barrier", 0.5, 1.5, 1.00, 0.05)
-    put_strike = st.number_input("Put strike", 0.3, 1.0, 0.70, 0.05)
-    rf = st.number_input("Risk-free rate", 0.0, 0.10, 0.045, 0.005)
-    sims = st.number_input("Simulations", 1000, 100000, 10000, 1000)
-    lookback = st.number_input("Lookback years", 1, 10, 5)
+    tickers_str = st.text_input(
+        "Basket tickers (comma-separated, e.g. AAPL,MSFT,NVDA)",
+        value="AAPL,MSFT,NVDA"
+    )
+    tenor = st.number_input(
+        "Tenor in years (e.g. 3)",
+        min_value=0.5, max_value=10.0, value=3.0, step=0.5
+    )
+    freq = st.number_input(
+        "Coupon frequency per year (e.g. 4 for quarterly)",
+        min_value=1, max_value=12, value=4
+    )
+    non_call_periods = st.number_input(
+        "Non-call / lockout periods (e.g. 4)",
+        min_value=0, max_value=20, value=4
+    )
+    ko_barrier = st.number_input(
+        "Knock-Out barrier as decimal (e.g. 1.00 = 100%)",
+        min_value=0.5, max_value=1.5, value=1.00, step=0.05
+    )
+    put_strike = st.number_input(
+        "Put strike as decimal (e.g. 0.70 = 70%)",
+        min_value=0.3, max_value=1.0, value=0.70, step=0.05
+    )
+    rf = st.number_input(
+        "Continuous risk-free rate (e.g. 0.045 = 4.5%)",
+        min_value=0.0, max_value=0.10, value=0.045, step=0.005
+    )
+    sims = st.number_input(
+        "Monte Carlo simulations (e.g. 10000; higher = more accurate but slower)",
+        min_value=1000, max_value=100000, value=10000, step=1000
+    )
+    lookback = st.number_input(
+        "Lookback years for vol/corr/div data (e.g. 5)",
+        min_value=1, max_value=10, value=5
+    )
     submitted = st.form_submit_button("Calculate")
 
 if submitted:
     tickers = [t.strip().upper() for t in tickers_str.split(",") if t.strip()]
     if not tickers:
-        st.error("Enter tickers.")
+        st.error("Enter at least one ticker.")
     else:
-        with st.spinner("Running... (10-90s)"):
+        with st.spinner("Fetching market data and running simulations... (may take 10-90 seconds)"):
             try:
                 results = price_fcn(tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf, sims, lookback)
-                st.success(f"Implied Yield p.a.: **{results['yield_pa']*100:.2f}%**")
+                st.success(f"Implied Annualized Yield p.a.: **{results['yield_pa']*100:.2f}%**")
                 
                 st.write(f"Probability of Autocall (early redemption): **{results['prob_autocall']*100:.2f}%**")
                 st.write(f"Probability of Survival to Maturity: **{results['prob_survival']*100:.2f}%**")
@@ -174,7 +201,7 @@ if submitted:
                 st.pyplot(results['fig'])
                 plt.close(results['fig'])
             except Exception as e:
-                st.error(f"Error: {str(e)}")
+                st.error(f"Error: {str(e)}. Check inputs, tickers, or try fewer sims.")
 
 st.markdown("---")
-st.caption("Worst-of, European barriers at coupon dates, GBM, real Yahoo data.")
+st.caption("Assumptions: Worst-of basket performance; European-style barriers (checked at period ends); GBM paths with constant vol/corr/div; no jumps or stoch vol. Uses real-time Yahoo Finance data.")
