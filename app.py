@@ -64,7 +64,7 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
     
     autocall_count = 0
     put_hit_count = 0
-    total_redemption_when_hit = 0.0  # For average loss severity
+    total_redemption_when_hit = 0.0
     
     for sim in range(n_sims):
         normals = np.random.normal(size=(num_periods, num_stocks))
@@ -188,27 +188,54 @@ if submitted:
 
                 if show_sensitivity:
                     st.subheader("Sensitivity Analysis")
-                    with st.spinner("Calculating sensitivity table..."):
+
+                    with st.spinner("Calculating sensitivity table (10 levels, 5% steps, centered on input)"):
                         if sensitivity_param == "KO barrier":
-                            levels = [0.90, 0.95, 1.00, 1.05, 1.10]
-                            param_name = "KO Level"
+                            base = ko_barrier
+                            step = 0.05
+                            levels = [base + (i - 5) * step for i in range(10)]
+                            levels = [max(0.50, min(1.50, l)) for l in levels]
+                            param_name = "KO Barrier"
                         else:
-                            levels = [0.60, 0.65, 0.70, 0.75, 0.80]
+                            base = put_strike
+                            step = 0.05
+                            levels = [base + (i - 5) * step for i in range(10)]
+                            levels = [max(0.30, min(1.00, l)) for l in levels]
                             param_name = "Put Strike"
 
                         table_data = []
                         for level in levels:
                             if sensitivity_param == "KO barrier":
-                                res = price_fcn(tickers, tenor, freq, non_call_periods, level, put_strike, rf, max(5000, sims//2), lookback_months)
+                                res = price_fcn(
+                                    tickers, tenor, freq, non_call_periods,
+                                    level, put_strike, rf,
+                                    max(3000, sims // 3), lookback_months
+                                )
                             else:
-                                res = price_fcn(tickers, tenor, freq, non_call_periods, ko_barrier, level, rf, max(5000, sims//2), lookback_months)
+                                res = price_fcn(
+                                    tickers, tenor, freq, non_call_periods,
+                                    ko_barrier, level, rf,
+                                    max(3000, sims // 3), lookback_months
+                                )
+
                             table_data.append({
                                 param_name: f"{level:.0%}",
                                 "Yield p.a.": f"{res['yield_pa']*100:.2f}%",
                                 "Prob Capital Loss": f"{res['prob_put_hit']*100:.2f}%"
                             })
+
                         df = pd.DataFrame(table_data)
-                        st.table(df)
+
+                        def highlight_middle(row):
+                            closest = min(levels, key=lambda x: abs(x - base))
+                            if row[param_name] == f"{closest:.0%}":
+                                return ['background-color: #e6f3ff'] * len(row)
+                            return [''] * len(row)
+
+                        st.table(
+                            df.style
+                              .apply(highlight_middle, axis=1)
+                        )
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
