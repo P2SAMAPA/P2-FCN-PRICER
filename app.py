@@ -3,27 +3,55 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.linalg import cholesky
-from datetime import datetime
+from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
-@st.cache_data(ttl=3600)
-def fetch_stock_data(tickers, lookback_months=60):
+@st.cache_data(ttl=1800)  # shorter cache for options data freshness
+def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
     end_date = datetime.now()
-    start_date = end_date - pd.Timedelta(days=lookback_months * 30 + 30)
-    data = yf.download(
-        tickers,
-        start=start_date,
-        end=end_date,
-        progress=False,
-        repair=True
-    )['Close']
+    start_date_hist = end_date - pd.Timedelta(days=lookback_months * 30 + 60)
+    data = yf.download(tickers, start=start_date_hist, end=end_date, progress=False, repair=True)['Close']
     if data.empty:
-        raise ValueError("No price data downloaded. Check tickers or connection.")
+        raise ValueError("No historical price data. Check tickers/internet.")
+
     log_returns = np.log(data / data.shift(1)).dropna()
-    
-    vols = log_returns.std() * np.sqrt(252)
-    corr_matrix = log_returns.corr()
-    
+    hist_vols = log_returns.std() * np.sqrt(252)
+    corr_matrix_hist = log_returns.corr()
+
+    # Implied vols
+    vols = pd.Series(index=tickers, dtype=float)
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            expirations = stock.options
+            if not expirations:
+                vols[ticker] = hist_vols[ticker]
+                continue
+
+            target_date = end_date + timedelta(days=iv_maturity_days)
+            closest_exp = min(expirations, key=lambda d: abs(datetime.strptime(d, '%Y-%m-%d') - target_date))
+            opt_chain = stock.option_chain(closest_exp)
+            calls, puts = opt_chain.calls, opt_chain.puts
+
+            current_price = stock.history(period='1d')['Close'].iloc[-1]
+            # ATM strike (closest to spot)
+            atm_strike_call = calls.iloc[(calls['strike'] - current_price).abs().argmin()]['strike']
+            atm_strike_put = puts.iloc[(puts['strike'] - current_price).abs().argmin()]['strike']
+
+            # Prefer call IV if available, average with put if both exist
+            call_iv = calls[calls['strike'] == atm_strike_call]['impliedVolatility'].values
+            put_iv = puts[puts['strike'] == atm_strike_put]['impliedVolatility'].values
+
+            ivs = []
+            if len(call_iv) > 0 and not np.isnan(call_iv[0]):
+                ivs.append(call_iv[0])
+            if len(put_iv) > 0 and not np.isnan(put_iv[0]):
+                ivs.append(put_iv[0])
+
+            vols[ticker] = np.mean(ivs) if ivs else hist_vols[ticker]
+        except Exception:
+            vols[ticker] = hist_vols[ticker]
+
     dividends = {}
     for ticker in tickers:
         try:
@@ -31,52 +59,61 @@ def fetch_stock_data(tickers, lookback_months=60):
             dividends[ticker] = info.get('trailingAnnualDividendYield', 0.0) or 0.0
         except:
             dividends[ticker] = 0.0
-    
-    return vols, corr_matrix, dividends
 
-def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback_months=60):
-    vols, corr_matrix, dividends = fetch_stock_data(tickers, lookback_months)
-    
+    return vols, corr_matrix_hist, dividends
+
+def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback_months=60, iv_maturity_days=30, equicorr_override=0.0):
+    vols, corr_hist, dividends = fetch_stock_data(tickers, lookback_months, iv_maturity_days)
+
     num_stocks = len(tickers)
     num_periods = int(T * freq)
     dt = T / num_periods
-    
+
     vol_vector = vols.values
-    cov_matrix = np.diag(vol_vector) @ corr_matrix.values @ np.diag(vol_vector)
+
+    # Correlation logic
+    if equicorr_override > 0.0001:
+        # Uniform correlation matrix
+        corr_matrix = np.full((num_stocks, num_stocks), equicorr_override)
+        np.fill_diagonal(corr_matrix, 1.0)
+    else:
+        corr_matrix = corr_hist.values
+
+    cov_matrix = np.diag(vol_vector) @ corr_matrix @ np.diag(vol_vector)
     try:
         chol_matrix = cholesky(cov_matrix, lower=True)
     except:
-        raise ValueError("Invalid correlation/vol matrix – try more lookback months or different tickers.")
-    
+        raise ValueError("Cov matrix invalid (not positive semi-definite). Try lower equicorr or more lookback.")
+
     drifts = rf - np.array([dividends.get(t, 0.0) for t in tickers]) - 0.5 * vol_vector**2
-    
+
     times = np.arange(1, num_periods + 1) * dt
     disc_factors = np.exp(-rf * times)
-    
+
     np.random.seed(42)
     disc_principals = np.zeros(n_sims)
     annuities = np.zeros(n_sims)
     term_periods = np.zeros(n_sims)
-    
+
     viz_sims = min(20, n_sims)
     worst_paths_viz = np.zeros((viz_sims, num_periods + 1))
     worst_paths_viz[:, 0] = 1.0
-    
+
     autocall_count = 0
     put_hit_count = 0
     total_redemption_when_hit = 0.0
-    
+
     for sim in range(n_sims):
         normals = np.random.normal(size=(num_periods, num_stocks))
         increments = drifts * dt + vol_vector * np.sqrt(dt) * (normals @ chol_matrix.T)
         log_paths = np.cumsum(increments, axis=0)
         paths = np.exp(log_paths)
         full_paths = np.vstack([np.ones(num_stocks), paths])
-        
+
         terminated = False
         term_period = num_periods
         redemption = 1.0
-        
+
         for period in range(1, num_periods + 1):
             worst = np.min(full_paths[period])
             if period > non_call and worst >= KO:
@@ -84,7 +121,7 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
                 term_period = period
                 redemption = 1.0
                 break
-        
+
         if not terminated:
             worst = np.min(full_paths[-1])
             if worst < strike:
@@ -93,29 +130,29 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
             redemption = 1.0 if worst >= strike else worst
         else:
             autocall_count += 1
-        
+
         annuity = np.sum(disc_factors[:term_period]) / freq
         disc_principal = disc_factors[term_period - 1] * redemption
-        
+
         disc_principals[sim] = disc_principal
         annuities[sim] = annuity
         term_periods[sim] = term_period
-        
+
         if sim < viz_sims:
             worst_path = np.minimum.reduce(full_paths, axis=1)
             worst_paths_viz[sim] = worst_path
-    
+
     avg_disc_principal = np.mean(disc_principals)
     avg_annuity = np.mean(annuities)
-    
+
     annualized_yield = (1 - avg_disc_principal) / avg_annuity if avg_annuity >= 1e-10 else 0.0
-    
+
     prob_autocall = autocall_count / n_sims
     prob_put_hit = put_hit_count / n_sims
     expected_coupons = np.mean(term_periods)
-    
+
     avg_loss_severity = (1.0 - total_redemption_when_hit / put_hit_count) if put_hit_count > 0 else 0.0
-    
+
     fig, ax = plt.subplots(figsize=(10, 6))
     time_axis = np.linspace(0, T, num_periods + 1)
     for i in range(viz_sims):
@@ -125,12 +162,12 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
     obs_times = np.arange(1/freq, T + 1/freq, 1/freq)
     for ot in obs_times:
         ax.axvline(x=ot, color='gray', linestyle=':', alpha=0.3)
-    ax.set_title(f'Simulated Worst-of Paths (First {viz_sims} Simulations)')
+    ax.set_title(f'Simulated Worst-of Paths (First {viz_sims} Sims)')
     ax.set_xlabel('Years')
     ax.set_ylabel('Performance (Initial = 1.0)')
     ax.legend()
     ax.grid(True)
-    
+
     results = {
         'yield_pa': annualized_yield,
         'prob_autocall': prob_autocall,
@@ -142,20 +179,22 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
     }
     return results
 
-# ————————————————————————————————————————
-st.title("Fixed Coupon Note (Autocallable Worst-of) Pricer")
-st.caption("Monte Carlo GBM – indication only")
+# ────────────────────────────────────────────────
+st.title("Fixed Coupon Note (Autocallable Worst-of) Pricer – Implied Vol + Corr Override")
+st.caption("Monte Carlo GBM – indication only, not advice. Implied vols from options; corr historical or equicorr override.")
 
 with st.form("inputs"):
     tickers_str = st.text_input("Basket tickers (comma-separated, e.g. AAPL,MSFT,NVDA)", "AAPL,MSFT,NVDA")
-    tenor = st.number_input("Tenor in years (e.g. 3)", 0.5, 10.0, 3.0, 0.5)
-    freq = st.number_input("Coupon frequency per year (e.g. 4 = quarterly)", 1, 12, 4)
-    non_call_periods = st.number_input("Non-call / lockout periods (e.g. 4)", 0, 20, 4)
-    ko_barrier = st.number_input("Knock-Out barrier (e.g. 1.00 = 100%)", 0.5, 1.5, 1.00, 0.05)
-    put_strike = st.number_input("Put strike (e.g. 0.70 = 70%)", 0.3, 1.0, 0.70, 0.05)
-    rf = st.number_input("Risk-free rate (e.g. 0.045 = 4.5%)", 0.0, 0.10, 0.045, 0.005)
-    sims = st.number_input("Monte Carlo simulations (10000 recommended)", 1000, 100000, 10000, 1000)
-    lookback_months = st.number_input("Lookback months for vol/corr/div (e.g. 60 = 5 years)", 1, 120, 60, 1)
+    tenor = st.number_input("Tenor in years (e.g. 3)", min_value=0.5, max_value=10.0, value=3.0, step=0.5)
+    freq = st.number_input("Coupon frequency per year (e.g. 4 = quarterly)", min_value=1, max_value=12, value=4)
+    non_call_periods = st.number_input("Non-call / lockout periods (e.g. 4)", min_value=0, max_value=20, value=4)
+    ko_barrier = st.number_input("Knock-Out barrier (e.g. 1.00 = 100%)", min_value=0.5, max_value=1.5, value=1.00, step=0.05)
+    put_strike = st.number_input("Put strike (e.g. 0.70 = 70%)", min_value=0.3, max_value=1.0, value=0.70, step=0.05)
+    rf = st.number_input("Risk-free rate (e.g. 0.045 = 4.5%)", min_value=0.0, max_value=0.10, value=0.045, step=0.005)
+    sims = st.number_input("Monte Carlo simulations (10000 recommended)", min_value=1000, max_value=100000, value=10000, step=1000)
+    lookback_months = st.number_input("Lookback months for correlation & fallback vol (e.g. 60 = 5 years)", min_value=1, max_value=120, value=60, step=1)
+    iv_maturity_days = st.number_input("Implied vol maturity days (ATM IV fetch, e.g. 30)", min_value=7, max_value=365, value=30, step=7)
+    equicorr_override = st.slider("Equicorrelation override (0 = use historical corr, 0.5 = assume 50% uniform corr)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
     
     col1, col2 = st.columns(2)
     with col1:
@@ -168,11 +207,11 @@ with st.form("inputs"):
 if submitted:
     tickers = [t.strip().upper() for t in tickers_str.split(",") if t.strip()]
     if not tickers:
-        st.error("Please enter at least one ticker.")
+        st.error("Enter at least one ticker.")
     else:
-        with st.spinner("Running Monte Carlo simulation..."):
+        with st.spinner("Fetching data & running Monte Carlo..."):
             try:
-                main_results = price_fcn(tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf, sims, lookback_months)
+                main_results = price_fcn(tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf, sims, lookback_months, iv_maturity_days, equicorr_override)
                 
                 st.success(f"Implied Annualized Yield p.a.: **{main_results['yield_pa']*100:.2f}%**")
                 st.write(f"• Probability of Autocall: **{main_results['prob_autocall']*100:.2f}%**")
@@ -188,7 +227,6 @@ if submitted:
 
                 if show_sensitivity:
                     st.subheader("Sensitivity Analysis")
-
                     with st.spinner("Calculating sensitivity table (10 levels, 5% steps, centered on input)"):
                         if sensitivity_param == "KO barrier":
                             base = ko_barrier
@@ -206,17 +244,9 @@ if submitted:
                         table_data = []
                         for level in levels:
                             if sensitivity_param == "KO barrier":
-                                res = price_fcn(
-                                    tickers, tenor, freq, non_call_periods,
-                                    level, put_strike, rf,
-                                    max(3000, sims // 3), lookback_months
-                                )
+                                res = price_fcn(tickers, tenor, freq, non_call_periods, level, put_strike, rf, max(3000, sims // 3), lookback_months, iv_maturity_days, equicorr_override)
                             else:
-                                res = price_fcn(
-                                    tickers, tenor, freq, non_call_periods,
-                                    ko_barrier, level, rf,
-                                    max(3000, sims // 3), lookback_months
-                                )
+                                res = price_fcn(tickers, tenor, freq, non_call_periods, ko_barrier, level, rf, max(3000, sims // 3), lookback_months, iv_maturity_days, equicorr_override)
 
                             table_data.append({
                                 param_name: f"{level:.0%}",
@@ -232,13 +262,10 @@ if submitted:
                                 return ['background-color: #e6f3ff'] * len(row)
                             return [''] * len(row)
 
-                        st.table(
-                            df.style
-                              .apply(highlight_middle, axis=1)
-                        )
+                        st.table(df.style.apply(highlight_middle, axis=1))
 
             except Exception as e:
-                st.error(f"Error: {str(e)}")
+                st.error(f"Error: {str(e)}. Try fewer sims, different tickers, or check internet.")
 
 st.markdown("---")
-st.caption("Worst-of Autocallable Fixed Coupon Note • European barriers • Real-time Yahoo Finance data • GBM model")
+st.caption("Uses implied ATM vols from options chains where available (fallback historical). Correlation: historical or equicorrelation override. GBM Monte Carlo. Real-time Yahoo data. Indication only.")
