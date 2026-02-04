@@ -4,14 +4,21 @@ import pandas as pd
 import yfinance as yf
 from scipy.linalg import cholesky
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour
 def fetch_stock_data(tickers, lookback_years=5):
     end_date = datetime.now()
     start_date = end_date - pd.Timedelta(days=lookback_years * 365 + 60)  # buffer
-    data = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close']
+    data = yf.download(
+        tickers,
+        start=start_date,
+        end=end_date,
+        progress=False,
+        repair=True
+    )['Close']
     if data.empty:
-        raise ValueError("No data downloaded – check tickers or internet.")
+        raise ValueError("No price data downloaded. Check ticker symbols, date range, or internet connection.")
     log_returns = np.log(data / data.shift(1)).dropna()
     
     vols = log_returns.std() * np.sqrt(252)
@@ -49,6 +56,14 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
     np.random.seed(42)
     disc_principals = np.zeros(n_sims)
     annuities = np.zeros(n_sims)
+    term_periods = np.zeros(n_sims)  # New: track term_period for each sim
+    
+    # For viz: save worst-of paths for first 20 sims
+    viz_sims = min(20, n_sims)
+    worst_paths_viz = np.zeros((viz_sims, num_periods + 1))  # +1 for t=0
+    worst_paths_viz[:, 0] = 1.0  # Start at 1.0
+    
+    autocall_count = 0  # Count sims with early autocall
     
     for sim in range(n_sims):
         normals = np.random.normal(size=(num_periods, num_stocks))
@@ -72,21 +87,57 @@ def price_fcn(tickers, T, freq, non_call, KO, strike, rf, n_sims=10000, lookback
         if not terminated:
             worst = np.min(full_paths[-1])
             redemption = 1.0 if worst >= strike else worst
+        else:
+            autocall_count += 1
         
         annuity = np.sum(disc_factors[:term_period]) / freq
         disc_principal = disc_factors[term_period - 1] * redemption
         
         disc_principals[sim] = disc_principal
         annuities[sim] = annuity
+        term_periods[sim] = term_period
+        
+        # Save worst-of path for viz if in first viz_sims
+        if sim < viz_sims:
+            worst_path = np.minimum.reduce(full_paths, axis=1)  # Worst-of per time step
+            worst_paths_viz[sim] = worst_path
     
     avg_disc_principal = np.mean(disc_principals)
     avg_annuity = np.mean(annuities)
     
     if avg_annuity < 1e-10:
-        return 0.0
+        annualized_yield = 0.0
+    else:
+        annualized_yield = (1 - avg_disc_principal) / avg_annuity
     
-    annualized_yield = (1 - avg_disc_principal) / avg_annuity
-    return annualized_yield
+    prob_autocall = autocall_count / n_sims
+    expected_coupons = np.mean(term_periods)  # Avg number of coupons paid
+    
+    # Create plot for simulated paths
+    fig, ax = plt.subplots(figsize=(10, 6))
+    time_axis = np.linspace(0, T, num_periods + 1)  # Years
+    for i in range(viz_sims):
+        ax.plot(time_axis, worst_paths_viz[i], alpha=0.5, linewidth=1)
+    ax.axhline(y=KO, color='g', linestyle='--', label='KO Barrier')
+    ax.axhline(y=strike, color='r', linestyle='--', label='Put Strike')
+    # Vertical lines for observation dates
+    obs_times = np.arange(1/freq, T + 1/freq, 1/freq)
+    for ot in obs_times:
+        ax.axvline(x=ot, color='gray', linestyle=':', alpha=0.3)
+    ax.set_title(f'Simulated Worst-of Paths (First {viz_sims} Sims)')
+    ax.set_xlabel('Years')
+    ax.set_ylabel('Performance (Initial = 1.0)')
+    ax.legend()
+    ax.grid(True)
+    
+    results = {
+        'yield_pa': annualized_yield,
+        'prob_autocall': prob_autocall,
+        'prob_survival': 1 - prob_autocall,
+        'expected_coupons': expected_coupons,
+        'fig': fig
+    }
+    return results
 
 # ────────────────────────────────────────────────
 st.title("Fixed Coupon Note (Autocallable Worst-of) Pricer")
@@ -111,8 +162,18 @@ if submitted:
     else:
         with st.spinner("Fetching market data and running simulations... (may take 10-90 seconds)"):
             try:
-                result = price_fcn(tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf, sims, lookback)
-                st.success(f"Implied Annualized Yield p.a.: **{result*100:.2f}%**")
+                results = price_fcn(tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf, sims, lookback)
+                st.success(f"Implied Annualized Yield p.a.: **{results['yield_pa']*100:.2f}%**")
+                
+                # New outputs
+                st.write(f"Probability of Autocall (early KO redemption): **{results['prob_autocall']*100:.2f}%**")
+                st.write(f"Probability of Survival to Maturity: **{results['prob_survival']*100:.2f}%**")
+                st.write(f"Expected Number of Coupons Paid: **{results['expected_coupons']:.2f}** (out of {int(tenor * freq)} possible)")
+                
+                # Display the plot
+                st.subheader("Simulated Worst-of Paths")
+                st.pyplot(results['fig'])
+                plt.close(results['fig'])  # Clean up
             except Exception as e:
                 st.error(f"Error: {str(e)}. Check inputs, tickers, or try fewer sims.")
 
