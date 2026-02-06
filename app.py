@@ -4,38 +4,36 @@ import pandas as pd
 import yfinance as yf
 from scipy.optimize import brentq
 
-# 1. Setup
 st.set_page_config(page_title="Institutional FCN Solver", layout="wide")
 st.markdown("## 🛡️ Institutional FCN Solver")
 
-# 2. Market Data Helpers
+# --- DATA ENGINE ---
 @st.cache_data(ttl=3600)
 def get_vols_and_corr(tickers, source):
-    vols = []
-    prices = []
+    vols, prices = [], []
     for t in tickers:
         try:
             s = yf.Ticker(t)
             h = s.history(period="12mo")['Close']
             prices.append(h.rename(t))
             hist_v = h.pct_change().std() * np.sqrt(252)
-            
             if source == "Market Implied (IV)":
                 opts = s.options
                 if opts:
+                    # Select nearest ATM IV
                     chain = s.option_chain(opts[min(len(opts)-1, 1)])
                     iv = chain.calls['impliedVolatility'].median()
-                    vols.append(iv if iv > 0.05 else hist_v)
+                    vols.append(iv if iv > 0.1 else hist_v)
                 else: vols.append(hist_v)
             else: vols.append(hist_v)
-        except: vols.append(0.30) # Default to 30% vol if ticker fails
+        except: vols.append(0.35) # High-vol default for risk-on assets
     
     df = pd.concat(prices, axis=1).dropna() if prices else pd.DataFrame()
     corr = df.pct_change().corr().values if not df.empty else np.eye(len(tickers))
     return np.array(vols), corr
 
-# 3. Simulation Functions (Must be defined before usage)
-def get_fcn_value(coupon_pa, paths, r, tenor, strike, ko, freq_m, nc_m):
+# --- CORE LOGIC ---
+def get_fcn_pv(coupon_pa, paths, r, tenor, strike, ko, freq_m, nc_m):
     steps, n_sims, _ = paths.shape
     worst_of = np.min(paths, axis=2)
     obs_dates = np.arange(int((freq_m/12)*252), steps, int((freq_m/12)*252))
@@ -57,50 +55,67 @@ def get_fcn_value(coupon_pa, paths, r, tenor, strike, ko, freq_m, nc_m):
         payoffs[active] = np.where(final_px >= strike, 100, final_px) + accrued[active]
     return np.mean(payoffs) * np.exp(-r * tenor)
 
-# 4. Sidebar Inputs
+# --- SIDEBAR (RESTORED TABS) ---
 with st.sidebar:
-    st.header("Settings")
+    st.header("1. Market Inputs")
     tk_in = st.text_input("Tickers (CSV)", "NVDA, TSLA")
     tickers = [x.strip().upper() for x in tk_in.split(",")]
     vol_src = st.radio("Vol Source", ["Historical (HV)", "Market Implied (IV)"])
-    skew = st.slider("Volatility Skew", 0.0, 1.0, 0.2)
+    skew = st.slider("Vol Skew Factor", 0.0, 1.0, 0.2)
     rf = st.number_input("Risk Free Rate %", 0.0, 10.0, 4.5) / 100
-    st.divider()
+    
+    st.header("2. Note Structure")
     tenor = st.number_input("Tenor (Years)", 0.5, 3.0, 1.0)
+    # RESTORED FREQUENCY
+    freq_label = st.selectbox("Coupon Frequency", ["Monthly", "Quarterly", "Semi-Annual", "Annual"])
+    freq_map = {"Monthly": 1, "Quarterly": 3, "Semi-Annual": 6, "Annual": 12}
+    freq_m = freq_map[freq_label]
+    
+    # RESTORED NON-CALL
+    nc_m = st.number_input("Non-Call Period (Months)", 0, 24, 3)
     stk = st.slider("Put Strike %", 40, 100, 60)
     ko = st.slider("KO Barrier %", 80, 150, 100)
 
-# 5. Main Execution
-if st.button("Solve FCN Structure"):
+# --- EXECUTION ---
+if st.button("Generate FCN Pricing"):
     vols, corr = get_vols_and_corr(tickers, vol_src)
     adj_vols = vols * (1 + skew)
     
-    # Monte Carlo Paths
-    n_sims, steps, dt = 10000, int(tenor * 252), 1/252
+    # Monte Carlo Path Gen
+    n_sims, steps, dt = 15000, int(tenor * 252), 1/252
     L = np.linalg.cholesky(corr + np.eye(len(corr)) * 1e-8)
     z = np.random.standard_normal((steps, n_sims, len(vols)))
     eps = np.einsum('ij,tkj->tki', L, z)
     drift = (rf - 0.5 * adj_vols**2) * dt
     diff = adj_vols * np.sqrt(dt) * eps
-    paths = np.exp(np.cumsum(drift + diff, axis=0))
-    paths = np.vstack([np.ones((1, n_sims, len(vols))), paths]) * 100
+    paths = np.vstack([np.ones((1, n_sims, len(vols))), np.exp(np.cumsum(drift + diff, axis=0))]) * 100
 
     # Solve for Coupon
     try:
-        y_solve = brentq(lambda c: get_fcn_value(c, paths, rf, tenor, stk, ko, 1, 3) - 100, 0.0, 2.0)
-    except: y_solve = 0.1 # Fallback to 10% if math fails
+        y_solve = brentq(lambda c: get_fcn_pv(c, paths, rf, tenor, stk, ko, freq_m, nc_m) - 100, 0.0, 3.0)
+    except: y_solve = 0.0
 
     st.markdown(f"### Solved Annualized Yield: **{y_solve*100:.2f}% p.a.**")
     
-    # Sensitivities
-    st.divider()
-    stks_range = [stk-10, stk, stk+10]
-    results = []
-    for s in stks_range:
-        try:
-            v = brentq(lambda c: get_fcn_value(c, paths, rf, tenor, s, ko, 1, 3) - 100, 0.0, 3.0)
-            results.append(v * 100)
-        except: results.append(0.0)
+    c1, c2 = st.columns(2)
+    p_loss = (np.sum(np.min(paths[-1], axis=1) < stk) / n_sims) * 100
+    c1.metric("Prob. Capital Loss", f"{p_loss:.1f}%")
     
-    df_res = pd.DataFrame([results], columns=[f"Strike {s}%" for s in stks_range], index=["Solved Yield %"])
-    st.table(df_res.style.background_gradient(cmap='RdYlGn', axis=1).format("{:.2f}"))
+    # SENSITIVITY MATRIX
+    st.divider()
+    st.markdown("### Yield Sensitivity Matrix (% p.a.)")
+    stks_range = [stk-10, stk, stk+10]
+    bars_range = [ko+10, ko, ko-10]
+    
+    grid = []
+    for b in bars_range:
+        row = []
+        for s in stks_range:
+            try:
+                val = brentq(lambda c: get_fcn_pv(c, paths, rf, tenor, s, b, freq_m, nc_m) - 100, 0.0, 4.0)
+                row.append(val * 100)
+            except: row.append(0.0)
+        grid.append(row)
+    
+    df_res = pd.DataFrame(grid, columns=[f"Stk {s}%" for s in stks_range], index=[f"KO {b}%" for b in bars_range])
+    st.table(df_res.style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2f}"))
