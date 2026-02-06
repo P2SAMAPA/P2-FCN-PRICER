@@ -41,14 +41,12 @@ def run_mc_core(c_g, pths, r, tnr, stk, ko, f_m, nc_m, b_r=0, b_f=0, step_down=0
     gv, bv = (c_g*(f_m/12))*100, (b_r*(f_m/12))*100
     
     for i, d in enumerate(obs):
-        # Apply Step-down if V2
+        # Step-down logic: Apply step per observation period
         curr_ko = ko - (i * step_down)
-        # Accrue Coupons
         acc[act] += gv
         if b_r > 0: acc[act & (wf[d] >= b_f)] += bv
         cpn_count[act] += 1
         
-        # Check Autocall
         if d >= int((nc_m/12)*252):
             ko_m = act & (wf[d] >= curr_ko)
             py[ko_m] = 100 + acc[ko_m]
@@ -59,7 +57,7 @@ def run_mc_core(c_g, pths, r, tnr, stk, ko, f_m, nc_m, b_r=0, b_f=0, step_down=0
     
     return np.mean(py) * np.exp(-r * tnr), np.mean(cpn_count), (np.sum(wf[-1] < stk)/n_s)
 
-# --- SIDEBAR ---
+# --- SIDEBAR GLOBAL ---
 with st.sidebar:
     st.header("🕹️ Global Controls")
     mode = st.selectbox("Select Product", ["FCN Version 1 (Stable)", "FCN Version 2 (Step-Down)", "BCN Solver"])
@@ -71,73 +69,103 @@ with st.sidebar:
     tenor_y = st.number_input("Tenor (Years)", 0.5, 3.0, 1.0)
     nc_m = st.number_input("Non-Call (M)", 0, 24, 3)
 
-# --- MAIN INTERFACE ---
-if "FCN" in mode:
-    st.title(f"🛡️ Institutional {mode}")
+# --- DISPATCHER ---
+if mode == "FCN Version 1 (Stable)":
+    st.title("🛡️ Institutional FCN (Stable V1)")
     ko_val = st.sidebar.slider("Autocall Level (KO) %", 80, 150, 105)
     stk_val = st.sidebar.slider("Protection Barrier (Put Strike) %", 40, 100, 60)
     fq = st.sidebar.selectbox("Payment Frequency", ["Monthly", "Quarterly"])
     fm = {"Monthly": 1, "Quarterly": 3}[fq]
-    step_d = st.sidebar.slider("Step-Down % (V2 Only)", 0.0, 2.0, 0.5) if "Version 2" in mode else 0.0
+    step_d = 0.0
 
-    if st.button("Generate Professional Pricing Report"):
+    if st.button("Generate Pricing Report (V1)"):
         v, c, lp = get_mkt_data(tks, vol_src); av = v*(1+skew)
         L = np.linalg.cholesky(c + np.eye(len(c))*1e-8)
         ps = np.vstack([np.ones((1, 10000, len(v))), np.exp(np.cumsum((rf_rate-0.5*av**2)*(1/252) + av*np.sqrt(1/252)*np.einsum('ij,tkj->tki', L, np.random.standard_normal((int(tenor_y*252), 10000, len(v)))), 0))])*100
+        y_solve = brentq(lambda x: run_mc_core(x, ps, rf_rate, tenor_y, stk_val, ko_val, fm, nc_m)[0] - 100, 0, 5)
+        val, avg_cpn, prob_loss = run_mc_core(y_solve, ps, rf_rate, tenor_y, stk_val, ko_val, fm, nc_m)
         
-        # Solve
-        y_solve = brentq(lambda x: run_mc_core(x, ps, rf_rate, tenor_y, stk_val, ko_val, fm, nc_m, step_down=step_d)[0] - 100, 0, 5)
-        _, avg_cpn, prob_loss = run_mc_core(y_solve, ps, rf_rate, tenor_y, stk_val, ko_val, fm, nc_m, step_down=step_d)
-
-        # Metrics Row
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Solved Yield (p.a.)", f"{y_solve*100:.2f}%")
         m2.metric("Prob. of Capital Loss", f"{prob_loss*100:.1f}%")
         m3.metric("Expected Coupons", f"{avg_cpn:.1f}")
         m4.metric("Protection Barrier", f"{stk_val}%")
-
-        st.divider()
         
-        # Sensitivity Tables
-        st.subheader("📊 Multi-Factor Sensitivity Matrix")
+        st.divider()
         stks, kos = [stk_val-10, stk_val, stk_val+10], [ko_val+10, ko_val, ko_val-10]
         gy, gl = [], []
         for b in kos:
             ry, rl = [], []
             for s in stks:
-                try: 
-                    res_y = brentq(lambda x: run_mc_core(x, ps, rf_rate, tenor_y, s, b, fm, nc_m, step_down=step_d)[0] - 100, 0, 5)*100
-                    ry.append(res_y)
+                try: ry.append(brentq(lambda x: run_mc_core(x, ps, rf_rate, tenor_y, s, b, fm, nc_m)[0] - 100, 0, 5)*100)
                 except: ry.append(0.0)
                 rl.append((np.sum(np.min(ps[-1], 1) < s)/10000)*100)
             gy.append(ry); gl.append(rl)
-
-        c_left, c_right = st.columns(2)
-        with c_left:
-            st.write("**Annualized Yield (%)** - *KO Barrier (Rows) vs Strike (Cols)*")
+        cl, cr = st.columns(2)
+        with cl:
+            st.write("**Annualized Yield (%)** - *KO (Rows) vs Strike (Cols)*")
             st.table(pd.DataFrame(gy, index=[f"KO {k}%" for k in kos], columns=[f"Stk {s}%" for s in stks]).style.background_gradient(cmap='RdYlGn'))
-        with c_right:
+        with cr:
+            st.write("**Capital Loss Probability (%)**")
+            st.table(pd.DataFrame(gl, index=[f"KO {k}%" for k in kos], columns=[f"Stk {s}%" for s in stks]).style.background_gradient(cmap='Reds'))
+
+elif mode == "FCN Version 2 (Step-Down)":
+    st.title("🛡️ Institutional FCN (Step-Down V2)")
+    ko_val = st.sidebar.slider("Initial Autocall Level %", 80, 150, 105)
+    stk_val = st.sidebar.slider("Protection Barrier %", 40, 100, 60)
+    fq = st.sidebar.selectbox("Payment Frequency", ["Monthly", "Quarterly"])
+    fm = {"Monthly": 1, "Quarterly": 3}[fq]
+    
+    # FORCED STEP=0.5 Logic
+    step_d = st.sidebar.slider("Step-Down % per period", 0.0, 2.0, value=0.5, step=0.5)
+
+    if st.button("Generate Pricing Report (V2)"):
+        v, c, lp = get_mkt_data(tks, vol_src); av = v*(1+skew)
+        L = np.linalg.cholesky(c + np.eye(len(c))*1e-8)
+        ps = np.vstack([np.ones((1, 10000, len(v))), np.exp(np.cumsum((rf_rate-0.5*av**2)*(1/252) + av*np.sqrt(1/252)*np.einsum('ij,tkj->tki', L, np.random.standard_normal((int(tenor_y*252), 10000, len(v)))), 0))])*100
+        y_solve = brentq(lambda x: run_mc_core(x, ps, rf_rate, tenor_y, stk_val, ko_val, fm, nc_m, step_down=step_d)[0] - 100, 0, 5)
+        val, avg_cpn, prob_loss = run_mc_core(y_solve, ps, rf_rate, tenor_y, stk_val, ko_val, fm, nc_m, step_down=step_d)
+        
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("V2 Solved Yield", f"{y_solve*100:.2f}%")
+        m2.metric("Prob. of Capital Loss", f"{prob_loss*100:.1f}%")
+        m3.metric("Expected Coupons", f"{avg_cpn:.1f}")
+        m4.metric("Step-Down Rate", f"{step_d}%")
+        
+        st.divider()
+        stks, kos = [stk_val-10, stk_val, stk_val+10], [ko_val+10, ko_val, ko_val-10]
+        gy, gl = [], []
+        for b in kos:
+            ry, rl = [], []
+            for s in stks:
+                try: ry.append(brentq(lambda x: run_mc_core(x, ps, rf_rate, tenor_y, s, b, fm, nc_m, step_down=step_d)[0] - 100, 0, 5)*100)
+                except: ry.append(0.0)
+                rl.append((np.sum(np.min(ps[-1], 1) < s)/10000)*100)
+            gy.append(ry); gl.append(rl)
+        cl, cr = st.columns(2)
+        with cl:
+            st.write("**Annualized Yield (%)** - *KO (Rows) vs Strike (Cols)*")
+            st.table(pd.DataFrame(gy, index=[f"KO {k}%" for k in kos], columns=[f"Stk {s}%" for s in stks]).style.background_gradient(cmap='RdYlGn'))
+        with cr:
             st.write("**Capital Loss Probability (%)**")
             st.table(pd.DataFrame(gl, index=[f"KO {k}%" for k in kos], columns=[f"Stk {s}%" for s in stks]).style.background_gradient(cmap='Reds'))
 
 else:
-    # --- BCN Solver (Restored UX) ---
     st.title("🛡️ Institutional BCN Solver")
     ko_b = st.sidebar.slider("KO Level %", 80, 150, 105)
     fq_b = st.sidebar.selectbox("Guar Freq", ["Monthly", "Quarterly"])
     fm_b, b_ref = {"Monthly": 1, "Quarterly": 3}[fq_b], st.sidebar.slider("Bonus Ref Strike %", 100, 130, 100)
-    col_a, col_b = st.columns(2)
-    g_cpn = col_a.number_input("Guaranteed Rate %", 0.0, 20.0, 4.0)/100
-    b_rate = col_b.number_input("Bonus Rate %", 0.0, 40.0, 8.0)/100
+    ga, ba = st.columns(2)
+    g_cpn = ga.number_input("Guar %", 0.0, 20.0, 4.0)/100
+    b_rate = ba.number_input("Bonus %", 0.0, 40.0, 8.0)/100
     
-    if st.button("Solve Required KI Barrier"):
+    if st.button("Solve BCN"):
         v, c, lp = get_mkt_data(tks, vol_src); av = v*(1+skew)
         L = np.linalg.cholesky(c + np.eye(len(c))*1e-8)
         ps = np.vstack([np.ones((1, 10000, len(v))), np.exp(np.cumsum((rf_rate-0.5*av**2)*(1/252) + av*np.sqrt(1/252)*np.einsum('ij,tkj->tki', L, np.random.standard_normal((int(tenor_y*252), 10000, len(v)))), 0))])*100
         try:
             ki = brentq(lambda x: run_mc_core(g_cpn, ps, rf_rate, tenor_y, x, ko_b, fm_b, nc_m, b_rate, b_ref)[0] - 100, 0.01, 150)
             st.metric("Required KI Barrier", f"{ki:.2f}%")
-            
             st.subheader("📊 KI Sensitivity Matrix")
             gs, bs = [g_cpn-0.01, g_cpn, g_cpn+0.01], [b_rate-0.02, b_rate, b_rate+0.02]
             gb = []
@@ -148,4 +176,4 @@ else:
                     except: rb.append(0.0)
                 gb.append(rb)
             st.table(pd.DataFrame(gb, index=[f"Bonus {x*100:.1f}%" for x in bs], columns=[f"Guar {x*100:.1f}%" for x in gs]).style.background_gradient(cmap='RdYlGn_r'))
-        except: st.error("Solver Error: The note value is too high for par issuance.")
+        except: st.error("Solver Error: Note value too high.")
