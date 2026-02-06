@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
 @st.cache_data(ttl=1800)
-def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
+def fetch_stock_data(tickers, lookback_months=60):
     end_date = datetime.now()
     start_date_hist = end_date - pd.Timedelta(days=lookback_months * 30 + 60)
     data = yf.download(tickers, start=start_date_hist, end=end_date, progress=False, repair=True)['Close']
@@ -15,7 +15,7 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
         raise ValueError("No historical price data. Check tickers or connection.")
     log_returns = np.log(data / data.shift(1)).dropna()
     
-    hist_vols = log_returns.std() * np.sqrt(252)
+    vols = log_returns.std() * np.sqrt(252)
     corr_matrix = log_returns.corr()
     
     dividends = {}
@@ -26,48 +26,15 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
         except:
             dividends[ticker] = 0.0
     
-    # Implied vols
-    implied_vols = pd.Series(index=tickers, dtype=float)
-    for ticker in tickers:
-        try:
-            stock = yf.Ticker(ticker)
-            expirations = stock.options
-            if not expirations:
-                implied_vols[ticker] = hist_vols[ticker]
-                continue
-
-            target_date = end_date + timedelta(days=iv_maturity_days)
-            closest_exp = min(expirations, key=lambda d: abs(datetime.strptime(d, '%Y-%m-%d') - target_date))
-            opt_chain = stock.option_chain(closest_exp)
-            calls, puts = opt_chain.calls, opt_chain.puts
-
-            current_price = stock.history(period='1d')['Close'].iloc[-1]
-            atm_strike_call = calls.iloc[(calls['strike'] - current_price).abs().argmin()]['strike']
-            atm_strike_put = puts.iloc[(puts['strike'] - current_price).abs().argmin()]['strike']
-
-            call_iv = calls[calls['strike'] == atm_strike_call]['impliedVolatility'].values
-            put_iv = puts[puts['strike'] == atm_strike_put]['impliedVolatility'].values
-
-            ivs = []
-            if len(call_iv) > 0 and not np.isnan(call_iv[0]):
-                ivs.append(call_iv[0])
-            if len(put_iv) > 0 and not np.isnan(put_iv[0]):
-                ivs.append(put_iv[0])
-
-            implied_vols[ticker] = np.mean(ivs) if ivs else hist_vols[ticker]
-        except Exception:
-            implied_vols[ticker] = hist_vols[ticker]
-
-    return hist_vols, implied_vols, corr_matrix, dividends
+    return vols, corr_matrix, dividends
 
 def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=10000,
-               lookback_months=60, iv_maturity_days=30, use_implied_vol=True,
+               lookback_months=60, use_implied_vol=True,
                skew_factor=1.0, equicorr_override=0.0,
                bonus_barrier=1.0, fixed_coupon=0.05, bonus_coupon=0.0):
     
-    hist_vols, implied_vols, corr_matrix, dividends = fetch_stock_data(tickers, lookback_months, iv_maturity_days)
+    vols, corr_matrix, dividends = fetch_stock_data(tickers, lookback_months)
 
-    vols = implied_vols if use_implied_vol else hist_vols
     vols = vols * skew_factor
 
     num_stocks = len(tickers)
@@ -210,7 +177,6 @@ with st.form("inputs"):
     rf = st.number_input("Risk-free rate (e.g. 0.045 = 4.5%)", min_value=0.0, max_value=0.10, value=0.045, step=0.005)
     sims = st.number_input("Monte Carlo simulations (10000 recommended)", min_value=1000, max_value=100000, value=10000, step=1000)
     lookback_months = st.number_input("Lookback months for vol/corr/dividends", min_value=1, max_value=120, value=60, step=1)
-    iv_maturity_days = st.number_input("Implied vol maturity days (ATM IV, e.g. 30)", min_value=7, max_value=365, value=30, step=7)
 
     use_implied_vol = st.checkbox("Use Implied Volatility (from options chain)", value=True)
     if not use_implied_vol:
@@ -245,11 +211,11 @@ if submitted:
             try:
                 if product == "FCN (Fixed Coupon Note)":
                     results = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
-                                         sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                         sims, lookback_months, use_implied_vol, skew_factor, equicorr_override,
                                          fixed_coupon=fixed_coupon)
                 else:
                     results = price_note("BCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
-                                         sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                         sims, lookback_months, use_implied_vol, skew_factor, equicorr_override,
                                          bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
 
                 st.success(f"Implied Annualized Yield p.a.: **{results['yield_pa']*100:.2f}%**")
@@ -286,24 +252,20 @@ if submitted:
                             if product == "FCN (Fixed Coupon Note)":
                                 if sensitivity_param == "KO barrier":
                                     res = price_note("FCN", tickers, tenor, freq, non_call_periods, level, put_strike, rf,
-                                                     max(3000, sims // 3), lookback_months, iv_maturity_days,
-                                                     use_implied_vol, skew_factor, equicorr_override,
+                                                     max(3000, sims // 3), lookback_months, use_implied_vol, skew_factor, equicorr_override,
                                                      fixed_coupon=fixed_coupon)
                                 else:
                                     res = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, level, rf,
-                                                     max(3000, sims // 3), lookback_months, iv_maturity_days,
-                                                     use_implied_vol, skew_factor, equicorr_override,
+                                                     max(3000, sims // 3), lookback_months, use_implied_vol, skew_factor, equicorr_override,
                                                      fixed_coupon=fixed_coupon)
                             else:
                                 if sensitivity_param == "KO barrier":
                                     res = price_note("BCN", tickers, tenor, freq, non_call_periods, level, put_strike, rf,
-                                                     max(3000, sims // 3), lookback_months, iv_maturity_days,
-                                                     use_implied_vol, skew_factor, equicorr_override,
+                                                     max(3000, sims // 3), lookback_months, use_implied_vol, skew_factor, equicorr_override,
                                                      bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
                                 else:
                                     res = price_note("BCN", tickers, tenor, freq, non_call_periods, ko_barrier, level, rf,
-                                                     max(3000, sims // 3), lookback_months, iv_maturity_days,
-                                                     use_implied_vol, skew_factor, equicorr_override,
+                                                     max(3000, sims // 3), lookback_months, use_implied_vol, skew_factor, equicorr_override,
                                                      bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
 
                             table_data.append({
