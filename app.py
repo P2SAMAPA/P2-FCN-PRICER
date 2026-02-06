@@ -23,18 +23,19 @@ def get_market_data(tickers, source):
     corr = df.pct_change().corr().values if not df.empty else np.eye(len(tickers))
     return np.array(vols), corr, np.array(last_px)
 
-def run_mc(coupon_pa, paths, r, tenor, strike, ko, freq_m, nc_m, b_rate=0, b_bar=0):
+def run_mc(cpn_guar, paths, r, tenor, strike, ko, freq_m, nc_m, b_rate=0, b_ref=0):
     steps, n_sims, _ = paths.shape
     worst_of = np.min(paths, axis=2)
     obs = np.arange(int((freq_m/12)*252), steps, int((freq_m/12)*252))
     payoffs, active, accrued = np.zeros(n_sims), np.ones(n_sims, dtype=bool), np.zeros(n_sims)
-    cpn, bonus = (coupon_pa*(freq_m/12))*100, (b_rate*(freq_m/12))*100
+    g_val, b_val = (cpn_guar*(freq_m/12))*100, (b_rate*(freq_m/12))*100
     for d in obs:
-        accrued[active] += cpn
-        if b_rate > 0: accrued[active & (worst_of[d] >= b_bar)] += bonus
+        accrued[active] += g_val
+        if b_rate > 0: accrued[active & (worst_of[d] >= b_ref)] += b_val
         if d >= int((nc_m/12)*252):
             ko_m = active & (worst_of[d] >= ko)
-            payoffs[ko_m] = 100 + accrued[ko_m]; active[ko_m] = False
+            payoffs[ko_m] = 100 + accrued[ko_m]
+            active[ko_m] = False
     if np.any(active):
         payoffs[active] = np.where(worst_of[-1, active] >= strike, 100, worst_of[-1, active]) + accrued[active]
     return np.mean(payoffs) * np.exp(-r * tenor)
@@ -79,7 +80,7 @@ else:
     st.markdown("## 🛡️ Institutional BCN Solver")
     freq_b = st.sidebar.selectbox("Guar. Frequency", ["Monthly", "Quarterly"])
     f_m_b = {"Monthly": 1, "Quarterly": 3}[freq_b]
-    b_ref = st.sidebar.slider("Bonus Ref Strike %", 100, 130, 100)
+    b_ref_val = st.sidebar.slider("Bonus Ref Strike %", 100, 130, 100)
     g_cpn = st.number_input("Guar. Coupon %", 0.0, 20.0, 4.0)/100
     b_cpn = st.number_input("Bonus Rate %", 0.0, 40.0, 8.0)/100
     if st.button("Solve KI Barrier"):
@@ -88,14 +89,14 @@ else:
         L = np.linalg.cholesky(c + np.eye(len(c)) * 1e-8)
         z = np.random.standard_normal((steps, 10000, len(v)))
         paths = np.vstack([np.ones((1, 10000, len(v))), np.exp(np.cumsum((rf - 0.5*av**2)*(1/252) + av*np.sqrt(1/252)*np.einsum('ij,tkj->tki', L, z), axis=0))]) * 100
-        ki = brentq(lambda s: run_mc(g_cpn, paths, rf, tenor, s, ko, f_m_b, nc_m_b, b_cpn, b_ref) - 100, 10, 100)
+        ki = brentq(lambda s: run_mc(g_cpn, paths, rf, tenor, s, ko, f_m_b, nc_m_b, b_cpn, b_ref_val) - 100, 10, 100)
         st.metric("Required KI Barrier", f"{ki:.2f}%")
         gr, br = [g_cpn-0.01, g_cpn, g_cpn+0.01], [b_cpn-0.02, b_cpn, b_cpn+0.02]
         gb = []
         for b in br:
             rb = []
             for g in gr:
-                try: rb.append(brentq(lambda s: run_mc(g, paths, rf, tenor, s, ko, f_m_b, nc_m_b, b, b_ref) - 100, 10, 150))
+                try: rb.append(brentq(lambda s: run_mc(g, paths, rf, tenor, s, ko, f_m_b, nc_m_b, b, b_ref_val) - 100, 10, 150))
                 except: rb.append(0.0)
             gb.append(rb)
         st.write("### KI Barrier Sensitivity"); st.table(pd.DataFrame(gb, columns=[f"{x*100:.1f}%" for x in gr], index=[f"{x*100:.1f}%" for x in br]).style.background_gradient(cmap='RdYlGn_r'))
