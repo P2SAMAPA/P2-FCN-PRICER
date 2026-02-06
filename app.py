@@ -61,11 +61,11 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
     return hist_vols, implied_vols, corr_matrix, dividends
 
 def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=10000,
-               lookback_months=60, use_implied_vol=True,
+               lookback_months=60, iv_maturity_days=30, use_implied_vol=True,
                skew_factor=1.0, equicorr_override=0.0,
                bonus_barrier=1.0, fixed_coupon=0.05, bonus_coupon=0.0):
     
-    hist_vols, implied_vols, corr_matrix, dividends = fetch_stock_data(tickers, lookback_months)
+    hist_vols, implied_vols, corr_matrix, dividends = fetch_stock_data(tickers, lookback_months, iv_maturity_days)
 
     vols = implied_vols if use_implied_vol else hist_vols
     vols = vols * skew_factor
@@ -134,7 +134,7 @@ def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=1
                 term_period = period
                 redemption = 1.0
                 autocall_count += 1
-                break
+                break  # Stop adding coupons after autocall
 
         if not terminated:
             worst = np.min(full_paths[-1])
