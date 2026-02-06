@@ -11,10 +11,13 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
     end_date = datetime.now()
     start_date_hist = end_date - pd.Timedelta(days=lookback_months * 30 + 60)
     data = yf.download(tickers, start=start_date_hist, end=end_date, progress=False, repair=True)['Close']
-    if data.empty:
-        raise ValueError("No historical price data. Check tickers/internet.")
+    if data.empty or len(data) < 30:
+        raise ValueError("Insufficient historical data for one or more tickers.")
 
     log_returns = np.log(data / data.shift(1)).dropna()
+    if log_returns.empty:
+        raise ValueError("No valid returns data. Try different tickers or longer lookback.")
+
     hist_vols = log_returns.std() * np.sqrt(252)
     corr_matrix_hist = log_returns.corr()
 
@@ -85,7 +88,7 @@ def price_note(product, tickers, T, freq, non_call, KO, strike, rf, n_sims=10000
     try:
         chol_matrix = cholesky(cov_matrix, lower=True)
     except:
-        st.warning("Covariance matrix issue – falling back to identity correlation")
+        st.warning("Covariance matrix issue – using identity matrix for stability")
         corr_matrix = np.eye(num_stocks)
         cov_matrix = np.diag(vol_vector**2)
         chol_matrix = cholesky(cov_matrix, lower=True)
@@ -95,7 +98,8 @@ def price_note(product, tickers, T, freq, non_call, KO, strike, rf, n_sims=10000
     times = np.arange(1, num_periods + 1) * dt
     disc_factors = np.exp(-rf * times)
 
-    np.random.seed(42)  # Keep for reproducibility between runs, but changes with different tickers
+    # Seed only once per run (allows variation with different inputs/tickers)
+    np.random.seed(42)
 
     disc_principals = np.zeros(n_sims)
     annuities = np.zeros(n_sims)
@@ -128,7 +132,7 @@ def price_note(product, tickers, T, freq, non_call, KO, strike, rf, n_sims=10000
             # Coupon logic
             coupon = 0.0
             if product == "FCN":
-                coupon = fixed_coupon / freq  # Now uses input fixed_coupon for FCN too
+                coupon = fixed_coupon / freq
             elif product == "BCN":
                 coupon = fixed_coupon / freq
                 if worst >= bonus_barrier:
@@ -173,7 +177,7 @@ def price_note(product, tickers, T, freq, non_call, KO, strike, rf, n_sims=10000
     fig, ax = plt.subplots(figsize=(10, 6))
     time_axis = np.linspace(0, T, num_periods + 1)
     for i in range(viz_sims):
-        ax.plot(time_axis, worst_paths_viz[i], alpha=0.6, linewidth=1.2)
+        ax.plot(time_axis, worst_paths_viz[i], alpha=0.4, linewidth=1.5, color='blue')
     ax.axhline(y=KO, color='g', linestyle='--', label='KO Barrier')
     ax.axhline(y=strike, color='r', linestyle='--', label='Put Strike')
     if product == "BCN":
@@ -184,6 +188,7 @@ def price_note(product, tickers, T, freq, non_call, KO, strike, rf, n_sims=10000
     ax.set_title(f'Simulated Worst-of Paths (First {viz_sims} Sims)')
     ax.set_xlabel('Years')
     ax.set_ylabel('Performance (Initial = 1.0)')
+    ax.set_ylim(0, 2.0)  # zoom to make paths visible
     ax.legend()
     ax.grid(True)
 
@@ -222,8 +227,8 @@ with st.form("inputs"):
     equicorr_override = st.slider("Equicorrelation override (0 = historical)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
 
     if product == "FCN (Fixed Coupon Note)":
-        fixed_coupon_fcn = st.number_input("Fixed coupon rate p.a. for FCN (e.g. 0.05 = 5%)", min_value=0.0, max_value=0.20, value=0.05, step=0.005)
-    if product == "BCN (Bonus Coupon Note)":
+        fixed_coupon = st.number_input("Fixed coupon rate p.a. for FCN (e.g. 0.05 = 5%)", min_value=0.0, max_value=0.20, value=0.05, step=0.005)
+    else:  # BCN
         bonus_barrier = st.number_input("Bonus barrier (e.g. 1.00 = 100%)", min_value=0.5, max_value=1.5, value=1.00, step=0.05)
         fixed_coupon = st.number_input("Fixed coupon rate p.a. (e.g. 0.05 = 5%)", min_value=0.0, max_value=0.20, value=0.05, step=0.005)
         bonus_coupon = st.number_input("Bonus coupon rate p.a. (e.g. 0.02 = 2%)", min_value=0.0, max_value=0.10, value=0.02, step=0.005)
@@ -243,8 +248,6 @@ if submitted:
     else:
         with st.spinner("Fetching data and running simulations..."):
             try:
-                fixed_coupon = fixed_coupon_fcn if product == "FCN (Fixed Coupon Note)" else fixed_coupon
-
                 if product == "FCN (Fixed Coupon Note)":
                     results = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
                                          sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
@@ -256,6 +259,7 @@ if submitted:
 
                 st.success(f"Implied Annualized Yield p.a.: **{results['yield_pa']*100:.2f}%**")
 
+                st.write(f"Vol source: **{'Implied' if use_implied_vol else 'Historical'}** (skew × {skew_factor:.2f})")
                 st.write(f"Probability of Autocall: **{results['prob_autocall']*100:.2f}%**")
                 st.write(f"Probability of Survival to Maturity: **{results['prob_survival']*100:.2f}%**")
                 st.write(f"Probability of Capital Loss (Put hit): **{results['prob_put_hit']*100:.2f}%**")
@@ -325,7 +329,7 @@ if submitted:
                         st.table(df.style.apply(highlight_middle, axis=1))
 
             except Exception as e:
-                st.error(f"Error: {str(e)}\n\nTry fewer simulations or check inputs.")
+                st.error(f"Error: {str(e)}\n\nTry fewer simulations, different tickers, or untick implied vol if fetch fails.")
 
 st.markdown("---")
 st.caption("Worst-of Autocallable Structured Notes • European barriers • GBM Monte Carlo • Yahoo Finance data • Implied vol option • Skew scalar • Equicorr override • Indication only")
