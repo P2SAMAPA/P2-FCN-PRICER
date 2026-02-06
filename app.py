@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
 @st.cache_data(ttl=1800)
-def fetch_stock_data(tickers, lookback_months=60):
+def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
     end_date = datetime.now()
     start_date_hist = end_date - pd.Timedelta(days=lookback_months * 30 + 60)
     data = yf.download(tickers, start=start_date_hist, end=end_date, progress=False, repair=True)['Close']
@@ -15,7 +15,7 @@ def fetch_stock_data(tickers, lookback_months=60):
         raise ValueError("No historical price data. Check tickers or connection.")
     log_returns = np.log(data / data.shift(1)).dropna()
     
-    vols = log_returns.std() * np.sqrt(252)
+    hist_vols = log_returns.std() * np.sqrt(252)
     corr_matrix = log_returns.corr()
     
     dividends = {}
@@ -26,15 +26,48 @@ def fetch_stock_data(tickers, lookback_months=60):
         except:
             dividends[ticker] = 0.0
     
-    return vols, corr_matrix, dividends
+    # Implied vols
+    implied_vols = pd.Series(index=tickers, dtype=float)
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            expirations = stock.options
+            if not expirations:
+                implied_vols[ticker] = hist_vols[ticker]
+                continue
+
+            target_date = end_date + timedelta(days=iv_maturity_days)
+            closest_exp = min(expirations, key=lambda d: abs(datetime.strptime(d, '%Y-%m-%d') - target_date))
+            opt_chain = stock.option_chain(closest_exp)
+            calls, puts = opt_chain.calls, opt_chain.puts
+
+            current_price = stock.history(period='1d')['Close'].iloc[-1]
+            atm_strike_call = calls.iloc[(calls['strike'] - current_price).abs().argmin()]['strike']
+            atm_strike_put = puts.iloc[(puts['strike'] - current_price).abs().argmin()]['strike']
+
+            call_iv = calls[calls['strike'] == atm_strike_call]['impliedVolatility'].values
+            put_iv = puts[puts['strike'] == atm_strike_put]['impliedVolatility'].values
+
+            ivs = []
+            if len(call_iv) > 0 and not np.isnan(call_iv[0]):
+                ivs.append(call_iv[0])
+            if len(put_iv) > 0 and not np.isnan(put_iv[0]):
+                ivs.append(put_iv[0])
+
+            implied_vols[ticker] = np.mean(ivs) if ivs else hist_vols[ticker]
+        except Exception:
+            implied_vols[ticker] = hist_vols[ticker]
+
+    return hist_vols, implied_vols, corr_matrix, dividends
 
 def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=10000,
                lookback_months=60, use_implied_vol=True,
                skew_factor=1.0, equicorr_override=0.0,
                bonus_barrier=1.0, fixed_coupon=0.05, bonus_coupon=0.0):
     
-    vols, corr_matrix, dividends = fetch_stock_data(tickers, lookback_months)
+    hist_vols, implied_vols, corr_matrix, dividends = fetch_stock_data(tickers, lookback_months)
 
+    vols = implied_vols if use_implied_vol else hist_vols
     vols = vols * skew_factor
 
     num_stocks = len(tickers)
@@ -62,8 +95,6 @@ def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=1
 
     times = np.arange(1, num_periods + 1) * dt
     disc_factors = np.exp(-rf * times)
-
-    np.random.seed(42)
 
     disc_principals = np.zeros(n_sims)
     annuities = np.zeros(n_sims)
