@@ -3,39 +3,47 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-st.set_page_config(page_title="Institutional FCN Solver", layout="wide")
+st.set_page_config(page_title="Institutional FCN Pricer", layout="wide")
 
-# --- DATA & SIMULATION ---
+# --- DATA LAYER ---
 @st.cache_data(ttl=3600)
-def get_simulated_paths(tickers, tenor, sims, skew_f, rf):
-    vols = []
+def get_market_data(tickers):
+    ivs, hvs = [], []
     for t in tickers:
         s = yf.Ticker(t)
         try:
             px = s.history(period="1d")['Close'].iloc[-1]
             chain = s.option_chain(s.options[min(len(s.options)-1, 6)])
-            vols.append(chain.calls.iloc[(chain.calls['strike'] - px).abs().argsort()[:1]]['impliedVolatility'].values[0])
-        except: vols.append(0.35)
+            iv = chain.calls.iloc[(chain.calls['strike'] - px).abs().argsort()[:1]]['impliedVolatility'].values[0]
+            ivs.append(iv)
+        except: ivs.append(0.35)
+        h = s.history(period="12mo")['Close'].pct_change().std() * np.sqrt(252)
+        hvs.append(h)
     
     data = yf.download(tickers, period="12mo", progress=False)['Close']
     corr = data.pct_change().dropna().corr().values if len(tickers) > 1 else np.array([[1.0]])
-    
+    return np.array(ivs), np.array(hvs), corr
+
+# --- ENGINE ---
+def get_simulation(sims, tenor, rf, vols, corr, skew_f):
     L = np.linalg.cholesky(corr + np.eye(len(corr)) * 1e-8)
     dt, steps = 1/252, int(tenor * 252)
-    adj_vols = np.array(vols) * (1 + skew_f)
+    # Applying Skew: Higher vol for downside protection
+    adj_vols = vols * (1 + skew_f)
     
     z = np.random.standard_normal((steps, sims, len(vols)))
     epsilon = np.einsum('ij,tkj->tki', L, z)
     drift = (rf - 0.5 * adj_vols**2) * dt
-    paths = np.exp(np.cumsum(drift + adj_vols * np.sqrt(dt) * epsilon, axis=0))
-    return np.vstack([np.ones((1, sims, len(vols))), paths]) * 100
+    path_returns = np.exp(np.cumsum(drift + adj_vols * np.sqrt(dt) * epsilon, axis=0))
+    return np.vstack([np.ones((1, sims, len(vols))), path_returns]) * 100
 
-# --- DISCRETE VALUATION ---
 def run_valuation_discrete(coupon_pa, paths, r, tenor, strike, ko, freq_m, nc_m):
     steps_total, n_sims, _ = paths.shape
     worst_of_paths = np.min(paths, axis=2)
     obs_interval = max(1, int((freq_m / 12) * 252))
     nc_steps = int((nc_m / 12) * 252)
+    
+    # European Observation: Only check on specific monthly/quarterly dates
     obs_dates = np.arange(obs_interval, steps_total, obs_interval)
     obs_dates = obs_dates[obs_dates >= nc_steps]
     
@@ -55,46 +63,72 @@ def run_valuation_discrete(coupon_pa, paths, r, tenor, strike, ko, freq_m, nc_m)
         num_cpns = (steps_total - 1) // obs_interval
         payoffs[active] = principal + (num_cpns * cpn_per_period)
         
-    return np.mean(payoffs) * np.exp(-r * tenor)
+    return {
+        "price": np.mean(payoffs) * np.exp(-r * tenor),
+        "prob_ko": np.mean(~active) * 100,
+        "prob_loss": (np.sum(active & (worst_of_paths[-1] < strike)) / n_sims) * 100,
+        "avg_cpn": (np.sum(~active * (np.arange(n_sims)//obs_interval)) + np.sum(active * (steps_total//obs_interval))) / n_sims # simplified estimate
+    }
 
 def solve_yield(paths, r, t, s, k, f, nc):
-    coupons = np.linspace(0.0, 0.60, 25)
-    prices = [run_valuation_discrete(c, paths, r, t, s, k, f, nc) for c in coupons]
+    coupons = np.linspace(0.0, 0.80, 40)
+    prices = [run_valuation_discrete(c, paths, r, t, s, k, f, nc)['price'] for c in coupons]
     return np.interp(100.0, prices, coupons)
 
 # --- UI ---
-st.title("🛡️ Institutional FCN Solver (Discrete Observation)")
+st.title("🛡️ Institutional FCN Solver")
 
 with st.sidebar:
-    st.header("Parameters")
-    tickers = [x.strip().upper() for x in st.text_input("Tickers (CSV)", "MSFT, GOOGL").split(",")]
-    tenor = st.number_input("Tenor (Yrs)", 0.5, 3.0, 1.0)
-    freq_m = st.selectbox("Coupon/KO Freq (Months)", [1, 3, 6], index=1)
-    nc_m = st.number_input("Non-Call Period (Months)", 0, 12, 3)
-    rf = st.number_input("Risk Free Rate %", 0.0, 10.0, 4.5) / 100
-    skew = st.slider("Vol Skew Factor", 0.0, 0.5, 0.1)
+    st.header("1. Market Inputs")
+    tickers = [x.strip().upper() for x in st.text_input("Tickers (CSV)", "TSLA, MSFT").split(",")]
+    vol_mode = st.radio("Volatility Source", ["Implied Vol (IV)", "Historical Vol (HV)"])
+    skew_val = st.slider("Volatility Skew Factor", 0.0, 1.0, 0.8) # Default 0.8 as requested
+    rf_rate = st.number_input("Risk Free Rate %", 0.0, 10.0, 4.5) / 100
     
-if st.button("Calculate Everything"):
-    with st.spinner("Simulating Paths..."):
-        paths = get_simulated_paths(tickers, tenor, 10000, skew, rf)
+    st.divider()
+    st.header("2. Product Specs")
+    tenor_y = st.number_input("Tenor (Y)", 0.1, 5.0, 1.0)
+    strike_p = st.number_input("Put Strike %", 40, 100, 60)
+    ko_p = st.number_input("KO Barrier %", 70, 150, 100)
+    freq_m = st.selectbox("Coupon/KO Frequency (M)", [1, 3, 6], index=0)
+    nc_m = st.number_input("Non-Call Period (M)", 0, 12, 3)
+
+if st.button("Solve & Generate Sensitivities"):
+    ivs, hvs, corr = get_market_data(tickers)
+    base_vols = ivs if vol_mode == "Implied Vol (IV)" else hvs
     
-    # Sensitivity Ranges
-    strikes = [50, 55, 60, 65, 70]
-    barriers = [110, 105, 100, 95, 90]
+    # Main Solve
+    paths = get_simulation(15000, tenor_y, rf_rate, base_vols, corr, skew_val)
+    yield_main = solve_yield(paths, rf_rate, tenor_y, strike_p, ko_p, freq_m, nc_m)
+    res = run_valuation_discrete(yield_main, paths, rf_rate, tenor_y, strike_p, ko_p, freq_m, nc_m)
+
+    # TOP OUTPUTS
+    st.header(f"Solved Yield: {yield_main*100:.2f}% p.a.")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Prob. of KO", f"{res['prob_ko']:.1f}%")
+    c2.metric("Prob. of Capital Loss", f"{res['prob_loss']:.1f}%")
+    c3.metric("Avg Coupons", f"{res['avg_cpn']:.1f}")
+
+    # SENSITIVITIES
+    st.divider()
+    ss = [strike_p-10, strike_p-5, strike_p, strike_p+5, strike_p+10]
+    kk = [ko_p+10, ko_p+5, ko_p, ko_p-5, ko_p-10]
+    y_grid, ki_grid = [], []
+
+    for kv in kk:
+        y_r, ki_r = [], []
+        for sv in ss:
+            yc = solve_yield(paths, rf_rate, tenor_y, sv, kv, freq_m, nc_m)
+            rc = run_valuation_discrete(yc, paths, rf_rate, tenor_y, sv, kv, freq_m, nc_m)
+            y_r.append(yc * 100); ki_r.append(rc['prob_loss'])
+        y_grid.append(y_r); ki_grid.append(ki_r)
+
+    df_y = pd.DataFrame(y_grid, index=kk, columns=ss)
+    df_y.index.name = "KO Barrier (%) ↓"
+    df_y.columns.name = "Put Strike (%) →"
+
+    st.subheader("Yield Sensitivity (% p.a.)")
+    st.dataframe(df_y.style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2f}"))
     
-    results = []
-    for ko in barriers:
-        row = []
-        for strike in strikes:
-            y = solve_yield(paths, rf, tenor, strike, ko, freq_m, nc_m)
-            row.append(y * 100)
-        results.append(row)
-    
-    # DataFrame with explicit Labels
-    df = pd.DataFrame(results, index=barriers, columns=strikes)
-    df.index.name = "KO Barrier (%) ↓"
-    df.columns.name = "Put Strike (%) →"
-    
-    st.subheader("Yield Sensitivity Table (% p.a.)")
-    st.markdown("Check KO Barrier on the **Left (Rows)** and Put Strike on the **Top (Columns)**.")
-    st.dataframe(df.style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2f}"))
+    st.subheader("Capital Loss Probability (%)")
+    st.dataframe(pd.DataFrame(ki_grid, index=kk, columns=ss).style.background_gradient(cmap='Reds', axis=None).format("{:.1f}"))
