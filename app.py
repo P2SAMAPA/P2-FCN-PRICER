@@ -258,7 +258,6 @@ if submitted:
                 st.pyplot(results['fig'])
                 plt.close(results['fig'])
 
-                # Sensitivity Table
                 if show_sensitivity:
                     st.subheader("Sensitivity Analysis")
                     with st.spinner("Calculating sensitivity table (10 levels, 5% steps, centered on input)"):
@@ -266,13 +265,13 @@ if submitted:
                             base = ko_barrier
                             step = 0.05
                             levels = [base + (i - 5) * step for i in range(10)]
-                            levels = [max(0.50, min(1.50, l)) for l in levels]
+                            levels = [max(0.50, min(1.50, l)) for l in l]
                             param_name = "KO Barrier"
                         else:
                             base = put_strike
                             step = 0.05
                             levels = [base + (i - 5) * step for i in range(10)]
-                            levels = [max(0.30, min(1.00, l)) for l in levels]
+                            levels = [max(0.30, min(1.0, l)) for l in l]
                             param_name = "Put Strike"
 
                         table_data = []
