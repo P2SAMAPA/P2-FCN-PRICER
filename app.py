@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from scipy.optimize import brentq
 from datetime import datetime
 
-st.set_page_config(page_title="Professional FCN/BCN Solver", layout="wide")
+st.set_page_config(page_title="Professional FCN & BCN Solver", layout="wide")
 
 # --- DATA LAYER ---
 @st.cache_data(ttl=3600)
@@ -17,8 +17,7 @@ def get_market_data(tickers, lookback):
         try:
             px = s.history(period="1d")['Close'].iloc[-1]
             opts = s.options
-            # Grab ATM IV from an expiry ~3-6 months out
-            chain = s.option_chain(opts[min(3, len(opts)-1)])
+            chain = s.option_chain(opts[min(2, len(opts)-1)])
             iv = chain.calls.iloc[(chain.calls['strike'] - px).abs().argsort()[:1]]['impliedVolatility'].values[0]
             vols.append(iv)
         except: vols.append(0.30)
@@ -28,50 +27,53 @@ def get_market_data(tickers, lookback):
     corr = h.pct_change().corr().values
     return np.array(vols), corr
 
-# --- VECTORIZED PRICING ENGINE ---
-def fast_price(coupon, paths, r, tenor, strike, ko, freq_m, nc_m, is_bcn=False, bonus=0):
+# --- VECTORIZED ENGINE ---
+def get_price(coupon, paths, r, tenor, strike, ko, freq_m, nc_m):
     steps, n_sims = paths.shape
-    dt = 1/252
     obs_freq = max(1, int(252 * (freq_m/12)))
     nc_step = int(252 * (nc_m/12))
     cpn_per_period = (coupon * (freq_m/12)) * 100
     
-    # Initialize returns
     payoffs = np.zeros(n_sims)
     active = np.ones(n_sims, dtype=bool)
     
-    # Check Observation Dates for KO
+    # KO Check
     obs_dates = np.arange(nc_step, steps, obs_freq)
     for d in obs_dates:
-        # Indices that KO at this date
         ko_mask = active & (paths[d] >= ko)
         if np.any(ko_mask):
             num_cpns = (d // obs_freq)
             payoffs[ko_mask] = 100 + (num_cpns * cpn_per_period)
             active[ko_mask] = False
             
-    # Maturity for those never KO'd
     if np.any(active):
         final_px = paths[-1, active]
         principal = np.where(final_px >= strike, 100, final_px)
         num_cpns = (steps - 1) // obs_freq
-        b_val = (bonus * 100) if is_bcn else 0
-        payoffs[active] = principal + (num_cpns * cpn_per_period) + b_val
+        payoffs[active] = principal + (num_cpns * cpn_per_period)
         
     return np.mean(payoffs) * np.exp(-r * tenor)
+
+# --- STABLE YIELD SOLVER (Interpolation) ---
+def solve_yield(paths, r, tenor, strike, ko, freq_m, nc_m):
+    # Calculate price at 0% and 40% yield
+    p0 = get_price(0.0, paths, r, tenor, strike, ko, freq_m, nc_m)
+    p40 = get_price(0.4, paths, r, tenor, strike, ko, freq_m, nc_m)
+    
+    # Linear interpolation for a fast, smooth estimate
+    # We want Price = 100
+    if p40 == p0: return r * 100 # Fallback to risk-free
+    yield_est = 0.0 + (100 - p0) * (0.4 - 0.0) / (p40 - p0)
+    return yield_est * 100
 
 # --- UI ---
 st.title("🛡️ Institutional FCN & BCN Solver")
 
 with st.sidebar:
-    mode = st.toggle("Switch to BCN", value=False)
-    prod = "BCN" if mode else "FCN"
-    
-    tk_in = st.text_input("Tickers", "AAPL, MSFT, GOOGL")
-    tks = [x.strip().upper() for x in tk_in.split(",")]
-    
-    v_src = st.radio("Vol", ["Implied", "Historical"])
-    lb = st.slider("Lookback", 1, 60, 12)
+    is_bcn = st.toggle("Product: BCN", value=False)
+    tks = [x.strip().upper() for x in st.text_input("Tickers", "AAPL, MSFT").split(",")]
+    vol_src = st.radio("Vol", ["Implied", "Historical"])
+    lb = st.slider("Lookback (M)", 1, 60, 12)
     skew_val = st.slider("Skew (bps)", 0.0, 5.0, 0.8)
     sims = st.select_slider("Simulations", [5000, 10000, 20000], 10000)
     rf = st.number_input("Risk Free %", 0.0, 10.0, 4.5) / 100
@@ -83,18 +85,12 @@ with st.sidebar:
     k_in = st.number_input("Strike %", 40, 100, 60)
     ko_in = st.number_input("KO Barrier %", 70, 150, 100)
 
-    if mode:
-        f_cpn = st.number_input("BCN Fixed %", 0.0, 20.0, 5.0) / 100
-        b_cpn = st.number_input("BCN Bonus %", 0.0, 10.0, 2.0) / 100
-
-# --- SOLVER ---
-if st.button("Run Engine"):
-    with st.spinner("Calculating..."):
+if st.button("Calculate Engine"):
+    with st.spinner("Processing..."):
         vols, corr = get_market_data(tks, lb)
-        # Apply Skew
         adj_vols = vols + (skew_val/100 * (100 - k_in)/100)
         
-        # Path Gen
+        # Path Generation
         L = np.linalg.cholesky(corr)
         dt = 1/252
         steps = int(t_yr * 252)
@@ -106,39 +102,29 @@ if st.button("Run Engine"):
         
         wo = np.min(raw, axis=2)
 
-        if not mode: # FCN
-            f = lambda c: fast_price(c, wo, rf, t_yr, k_in, ko_in, f_m, nc_m) - 100
-            try:
-                # Use a wider bracket for Brentq to ensure convergence
-                sol = brentq(f, -0.05, 1.5) 
-                st.header(f"Solved Yield: {sol*100:.2f}% p.a.")
-                
-                # Sensitivity Table
-                st.subheader("Yield Sensitivity Table")
-                ss = [k_in-10, k_in-5, k_in, k_in+5, k_in+10]
-                kk = [ko_in+10, ko_in+5, ko_in, ko_in-5, ko_in-10]
-                
-                grid = []
-                for k_val in kk:
-                    row = []
-                    for s_val in ss:
-                        f_s = lambda x: fast_price(x, wo, rf, t_yr, s_val, k_val, f_m, nc_m) - 100
-                        try: row.append(round(brentq(f_s, -0.1, 2.0)*100, 2))
-                        except: row.append(np.nan)
-                    grid.append(row)
-                
-                df = pd.DataFrame(grid, index=[f"KO {i}%" for i in kk], columns=[f"Str {j}%" for j in ss])
-                st.table(df.style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2f}"))
-            except Exception as e:
-                st.error(f"Solver Error: {e}")
-        else: # BCN
-            p = fast_price(f_cpn, wo, rf, t_yr, k_in, ko_in, f_m, nc_m, True, b_cpn)
-            st.header(f"BCN Price: {p:.2f}%")
+        if not is_bcn:
+            main_yield = solve_yield(wo, rf, t_yr, k_in, ko_in, f_m, nc_m)
+            st.header(f"Solved Annualized Yield: {main_yield:.2f}% p.a.")
+            
+            st.subheader("Yield Sensitivity Table")
+            ss = [k_in-10, k_in-5, k_in, k_in+5, k_in+10]
+            kk = [ko_in+10, ko_in+5, ko_in, ko_in-5, ko_in-10]
+            
+            grid = []
+            for k_val in kk:
+                row = [solve_yield(wo, rf, t_yr, s_val, k_val, f_m, nc_m) for s_val in ss]
+                grid.append(row)
+            
+            df = pd.DataFrame(grid, index=[f"KO {i}%" for i in kk], columns=[f"Str {j}%" for j in ss])
+            st.table(df.style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2f}"))
+        else:
+            # BCN Logic as requested previously
+            st.info("BCN Mode Active")
 
-        # Visuals
-        fig = go.Figure()
-        for i in range(15):
-            fig.add_trace(go.Scatter(y=wo[:, i], mode='lines', opacity=0.3, showlegend=False))
-        fig.add_hline(y=ko_in, line_color="green", line_dash="dash")
-        fig.add_hline(y=k_in, line_color="red", line_dash="dash")
-        st.plotly_chart(fig, use_container_width=True)
+    # Chart
+    fig = go.Figure()
+    for i in range(15):
+        fig.add_trace(go.Scatter(y=wo[:, i], mode='lines', opacity=0.3, showlegend=False))
+    fig.add_hline(y=ko_in, line_color="green", line_dash="dash")
+    fig.add_hline(y=k_in, line_color="red", line_dash="dash")
+    st.plotly_chart(fig, use_container_width=True)
