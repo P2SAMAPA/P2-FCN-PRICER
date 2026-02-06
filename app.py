@@ -208,7 +208,8 @@ with st.form("inputs"):
     rf = st.number_input("Risk-free rate (e.g. 0.045 = 4.5%)", min_value=0.0, max_value=0.10, value=0.045, step=0.005)
     sims = st.number_input("Monte Carlo simulations (10000 recommended)", min_value=1000, max_value=100000, value=10000, step=1000)
     lookback_months = st.number_input("Lookback months for vol/corr/dividends", min_value=1, max_value=120, value=60, step=1)
-    
+    iv_maturity_days = st.number_input("Implied vol maturity days (ATM IV, e.g. 30)", min_value=7, max_value=365, value=30, step=7)
+
     use_implied_vol = st.checkbox("Use Implied Volatility (from options chain)", value=True)
     if not use_implied_vol:
         st.info("Implied volatility is turned OFF → using historical volatility from lookback.")
