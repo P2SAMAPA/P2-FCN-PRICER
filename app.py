@@ -85,14 +85,18 @@ def price_note(product, tickers, T, freq, non_call, KO, strike, rf, n_sims=10000
     try:
         chol_matrix = cholesky(cov_matrix, lower=True)
     except:
-        raise ValueError("Covariance matrix not positive semi-definite. Try lower equicorr or different vols.")
+        st.warning("Covariance matrix issue – falling back to identity correlation")
+        corr_matrix = np.eye(num_stocks)
+        cov_matrix = np.diag(vol_vector**2)
+        chol_matrix = cholesky(cov_matrix, lower=True)
 
     drifts = rf - np.array([dividends.get(t, 0.0) for t in tickers]) - 0.5 * vol_vector**2
 
     times = np.arange(1, num_periods + 1) * dt
     disc_factors = np.exp(-rf * times)
 
-    np.random.seed(42)
+    np.random.seed(42)  # Keep for reproducibility between runs, but changes with different tickers
+
     disc_principals = np.zeros(n_sims)
     annuities = np.zeros(n_sims)
     term_periods = np.zeros(n_sims)
@@ -124,7 +128,7 @@ def price_note(product, tickers, T, freq, non_call, KO, strike, rf, n_sims=10000
             # Coupon logic
             coupon = 0.0
             if product == "FCN":
-                coupon = 1.0 / freq  # Placeholder – adjust if you have fixed coupon input for FCN
+                coupon = fixed_coupon / freq  # Now uses input fixed_coupon for FCN too
             elif product == "BCN":
                 coupon = fixed_coupon / freq
                 if worst >= bonus_barrier:
@@ -169,7 +173,7 @@ def price_note(product, tickers, T, freq, non_call, KO, strike, rf, n_sims=10000
     fig, ax = plt.subplots(figsize=(10, 6))
     time_axis = np.linspace(0, T, num_periods + 1)
     for i in range(viz_sims):
-        ax.plot(time_axis, worst_paths_viz[i], alpha=0.5, linewidth=1)
+        ax.plot(time_axis, worst_paths_viz[i], alpha=0.6, linewidth=1.2)
     ax.axhline(y=KO, color='g', linestyle='--', label='KO Barrier')
     ax.axhline(y=strike, color='r', linestyle='--', label='Put Strike')
     if product == "BCN":
@@ -217,6 +221,8 @@ with st.form("inputs"):
     skew_factor = st.slider("Volatility skew adjustment factor (1.0 = neutral)", min_value=0.70, max_value=1.50, value=1.00, step=0.05)
     equicorr_override = st.slider("Equicorrelation override (0 = historical)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
 
+    if product == "FCN (Fixed Coupon Note)":
+        fixed_coupon_fcn = st.number_input("Fixed coupon rate p.a. for FCN (e.g. 0.05 = 5%)", min_value=0.0, max_value=0.20, value=0.05, step=0.005)
     if product == "BCN (Bonus Coupon Note)":
         bonus_barrier = st.number_input("Bonus barrier (e.g. 1.00 = 100%)", min_value=0.5, max_value=1.5, value=1.00, step=0.05)
         fixed_coupon = st.number_input("Fixed coupon rate p.a. (e.g. 0.05 = 5%)", min_value=0.0, max_value=0.20, value=0.05, step=0.005)
@@ -237,9 +243,12 @@ if submitted:
     else:
         with st.spinner("Fetching data and running simulations..."):
             try:
+                fixed_coupon = fixed_coupon_fcn if product == "FCN (Fixed Coupon Note)" else fixed_coupon
+
                 if product == "FCN (Fixed Coupon Note)":
                     results = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
-                                         sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override)
+                                         sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                         fixed_coupon=fixed_coupon)
                 else:
                     results = price_note("BCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
                                          sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
@@ -265,13 +274,13 @@ if submitted:
                             base = ko_barrier
                             step = 0.05
                             levels = [base + (i - 5) * step for i in range(10)]
-                            levels = [max(0.50, min(1.50, level)) for level in levels]  # FIXED
+                            levels = [max(0.50, min(1.50, level)) for level in levels]
                             param_name = "KO Barrier"
                         else:
                             base = put_strike
                             step = 0.05
                             levels = [base + (i - 5) * step for i in range(10)]
-                            levels = [max(0.30, min(1.00, level)) for level in levels]  # FIXED
+                            levels = [max(0.30, min(1.00, level)) for level in levels]
                             param_name = "Put Strike"
 
                         table_data = []
@@ -280,11 +289,13 @@ if submitted:
                                 if sensitivity_param == "KO barrier":
                                     res = price_note("FCN", tickers, tenor, freq, non_call_periods, level, put_strike, rf,
                                                      max(3000, sims // 3), lookback_months, iv_maturity_days,
-                                                     use_implied_vol, skew_factor, equicorr_override)
+                                                     use_implied_vol, skew_factor, equicorr_override,
+                                                     fixed_coupon=fixed_coupon)
                                 else:
                                     res = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, level, rf,
                                                      max(3000, sims // 3), lookback_months, iv_maturity_days,
-                                                     use_implied_vol, skew_factor, equicorr_override)
+                                                     use_implied_vol, skew_factor, equicorr_override,
+                                                     fixed_coupon=fixed_coupon)
                             else:  # BCN
                                 if sensitivity_param == "KO barrier":
                                     res = price_note("BCN", tickers, tenor, freq, non_call_periods, level, put_strike, rf,
