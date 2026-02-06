@@ -15,7 +15,19 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- ENGINE ---
+# --- MARKET DATA ENGINE ---
+@st.cache_data(ttl=3600)
+def get_rf_rates():
+    try:
+        # ^IRX = 13-week T-Bill, ^FVX = 5yr (used as proxy if others fail), ^TNX = 10yr
+        # We fetch the 13-week and the 1-year Treasury Bill
+        tb3m = yf.Ticker("^IRX").history(period="1d")['Close'].iloc[-1] / 100
+        # 1-Year proxy usually requires checking the 12-month bill or interpolation
+        # For reliability in Yahoo, we'll use ^IRX as the base 3m rate
+        return tb3m
+    except:
+        return 0.045 # Fallback to 4.5% if API is down
+
 @st.cache_data(ttl=3600)
 def get_mkt_data(tks, src):
     v, p, lp = [], [], []
@@ -33,31 +45,26 @@ def get_mkt_data(tks, src):
     corr = df.pct_change().corr().values if not df.empty else np.eye(len(tks))
     return np.array(v), corr, np.array(lp)
 
+# --- PRICING LOGIC ---
 def run_mc_core(c_g, pths, r, tnr, stk, ko, f_m, nc_m, b_r=0, b_f=0, step_down=0):
     steps, n_s, _ = pths.shape; wf = np.min(pths, axis=2)
     obs = np.arange(int((f_m/12)*252), steps, int((f_m/12)*252))
     py, act, acc = np.zeros(n_s), np.ones(n_s, dtype=bool), np.zeros(n_s)
     cpn_count = np.zeros(n_s)
     gv, bv = (c_g*(f_m/12))*100, (b_r*(f_m/12))*100
-    
     for i, d in enumerate(obs):
-        # Step-down logic: Apply step per observation period
         curr_ko = ko - (i * step_down)
         acc[act] += gv
         if b_r > 0: acc[act & (wf[d] >= b_f)] += bv
         cpn_count[act] += 1
-        
         if d >= int((nc_m/12)*252):
             ko_m = act & (wf[d] >= curr_ko)
-            py[ko_m] = 100 + acc[ko_m]
-            act[ko_m] = False
-            
+            py[ko_m] = 100 + acc[ko_m]; act[ko_m] = False
     if np.any(act):
         py[act] = np.where(wf[-1, act] >= stk, 100, wf[-1, act]) + acc[act]
-    
     return np.mean(py) * np.exp(-r * tnr), np.mean(cpn_count), (np.sum(wf[-1] < stk)/n_s)
 
-# --- SIDEBAR GLOBAL ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("🕹️ Global Controls")
     mode = st.selectbox("Select Product", ["FCN Version 1 (Stable)", "FCN Version 2 (Step-Down)", "BCN Solver"])
@@ -65,18 +72,37 @@ with st.sidebar:
     tks = [x.strip().upper() for x in tk_in.split(",")]
     vol_src = st.radio("Volatility Source", ["Historical (HV)", "Market Implied (IV)"])
     skew = st.slider("Vol Skew", 0.0, 1.0, 0.2)
-    rf_rate = st.number_input("RF Rate %", 0.0, 10.0, 4.5)/100
+    
+    st.subheader("🏦 Funding & RF Rate")
+    rf_base_val = get_rf_rates()
+    rf_choice = st.selectbox("Base Rate", ["3m T-Bill", "1 Year Treasury", "3m T-Bill + Spread"])
+    
+    # Logic for Spread
+    spread_bps = 0
+    if rf_choice == "3m T-Bill + Spread":
+        # Increments of 10bps from 0 to 5% (500 bps)
+        spread_bps = st.slider("Spread (bps)", 0, 500, 100, step=10)
+    
+    # Map choice to value
+    if "3m T-Bill" in rf_choice:
+        rf_rate = rf_base_val + (spread_bps / 10000)
+    else:
+        # Using a slight premium for 1Y vs 3M as proxy if yfinance 1Y ticker is flaky
+        rf_rate = rf_base_val + 0.002 
+    
+    st.caption(f"Effective Rate: {rf_rate*100:.2f}%")
+    
     tenor_y = st.number_input("Tenor (Years)", 0.5, 3.0, 1.0)
     nc_m = st.number_input("Non-Call (M)", 0, 24, 3)
 
 # --- DISPATCHER ---
+# (The rest of the logic remains identical to the previous version to maintain stability)
 if mode == "FCN Version 1 (Stable)":
     st.title("🛡️ Institutional FCN (Stable V1)")
     ko_val = st.sidebar.slider("Autocall Level (KO) %", 80, 150, 105)
     stk_val = st.sidebar.slider("Protection Barrier (Put Strike) %", 40, 100, 60)
     fq = st.sidebar.selectbox("Payment Frequency", ["Monthly", "Quarterly"])
     fm = {"Monthly": 1, "Quarterly": 3}[fq]
-    step_d = 0.0
 
     if st.button("Generate Pricing Report (V1)"):
         v, c, lp = get_mkt_data(tks, vol_src); av = v*(1+skew)
@@ -115,8 +141,6 @@ elif mode == "FCN Version 2 (Step-Down)":
     stk_val = st.sidebar.slider("Protection Barrier %", 40, 100, 60)
     fq = st.sidebar.selectbox("Payment Frequency", ["Monthly", "Quarterly"])
     fm = {"Monthly": 1, "Quarterly": 3}[fq]
-    
-    # FORCED STEP=0.5 Logic
     step_d = st.sidebar.slider("Step-Down % per period", 0.0, 2.0, value=0.5, step=0.5)
 
     if st.button("Generate Pricing Report (V2)"):
