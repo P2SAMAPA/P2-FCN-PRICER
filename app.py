@@ -265,13 +265,13 @@ if submitted:
                             base = ko_barrier
                             step = 0.05
                             levels = [base + (i - 5) * step for i in range(10)]
-                            levels = [max(0.50, min(1.50, l)) for l in l]
+                            levels = [max(0.50, min(1.50, level)) for level in levels]  # FIXED
                             param_name = "KO Barrier"
                         else:
                             base = put_strike
                             step = 0.05
                             levels = [base + (i - 5) * step for i in range(10)]
-                            levels = [max(0.30, min(1.0, l)) for l in l]
+                            levels = [max(0.30, min(1.00, level)) for level in levels]  # FIXED
                             param_name = "Put Strike"
 
                         table_data = []
