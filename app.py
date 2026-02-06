@@ -18,7 +18,7 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
     hist_vols = log_returns.std() * np.sqrt(252)
     corr_matrix = log_returns.corr().fillna(0).clip(-0.99, 0.99)
     
-    # Regularize corr to PSD
+    # Regularize to PSD
     eigenvalues, eigenvectors = eigh(corr_matrix)
     eigenvalues = np.maximum(eigenvalues, 1e-8)
     corr_matrix = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
@@ -33,7 +33,7 @@ def fetch_stock_data(tickers, lookback_months=60, iv_maturity_days=30):
         except:
             dividends[ticker] = 0.0
     
-    # Implied vols (fallback to hist)
+    # Implied vols fallback to hist
     implied_vols = pd.Series(hist_vols, index=tickers)
     for ticker in tickers:
         try:
@@ -128,7 +128,7 @@ def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=1
         for period in range(1, num_periods + 1):
             worst = np.min(full_paths[period])
 
-            coupon = fixed_coupon / freq
+            coupon = fixed_coupon / freq if product == "BCN" else 0.05 / freq  # default for FCN
             if product == "BCN" and worst >= bonus_barrier:
                 coupon += bonus_coupon / freq
             coupon_annuity += disc_factors[period - 1] * coupon
@@ -138,7 +138,7 @@ def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=1
                 term_period = period
                 redemption = 1.0
                 autocall_count += 1
-                break  # stop coupons
+                break
 
         if not terminated:
             worst = np.min(full_paths[-1])
@@ -221,7 +221,8 @@ with st.form("inputs"):
     equicorr_override = st.slider("Equicorrelation override (0 = historical)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
 
     if product == "FCN (Fixed Coupon Note)":
-        fixed_coupon = st.number_input("Fixed coupon rate p.a. (e.g. 0.05 = 5%)", min_value=0.0, max_value=0.20, value=0.05, step=0.005)
+        # No fixed coupon input for FCN
+        fixed_coupon = 0.05  # internal default
         bonus_barrier = 1.0
         bonus_coupon = 0.0
     else:
@@ -244,14 +245,9 @@ if submitted:
     else:
         with st.spinner("Fetching data and running simulations..."):
             try:
-                if product == "FCN (Fixed Coupon Note)":
-                    results = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
-                                         sims, lookback_months, use_implied_vol, skew_factor, equicorr_override,
-                                         fixed_coupon=fixed_coupon)
-                else:
-                    results = price_note("BCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
-                                         sims, lookback_months, use_implied_vol, skew_factor, equicorr_override,
-                                         bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
+                results = price_note(product, tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
+                                     sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                     bonus_barrier, fixed_coupon, bonus_coupon)
 
                 st.success(f"Implied Annualized Yield p.a.: **{results['yield_pa']*100:.2f}%**")
 
@@ -288,20 +284,20 @@ if submitted:
                             if product == "FCN (Fixed Coupon Note)":
                                 if sensitivity_param == "KO barrier":
                                     res = price_note("FCN", tickers, tenor, freq, non_call_periods, level, put_strike, rf,
-                                                     max(3000, sims // 3), lookback_months, use_implied_vol, skew_factor, equicorr_override,
-                                                     fixed_coupon=fixed_coupon)
+                                                     max(3000, sims // 3), lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                                     bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
                                 else:
                                     res = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, level, rf,
-                                                     max(3000, sims // 3), lookback_months, use_implied_vol, skew_factor, equicorr_override,
-                                                     fixed_coupon=fixed_coupon)
+                                                     max(3000, sims // 3), lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                                     bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
                             else:
                                 if sensitivity_param == "KO barrier":
                                     res = price_note("BCN", tickers, tenor, freq, non_call_periods, level, put_strike, rf,
-                                                     max(3000, sims // 3), lookback_months, use_implied_vol, skew_factor, equicorr_override,
+                                                     max(3000, sims // 3), lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
                                                      bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
                                 else:
                                     res = price_note("BCN", tickers, tenor, freq, non_call_periods, ko_barrier, level, rf,
-                                                     max(3000, sims // 3), lookback_months, use_implied_vol, skew_factor, equicorr_override,
+                                                     max(3000, sims // 3), lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
                                                      bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
 
                             table_data.append({
