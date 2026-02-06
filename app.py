@@ -91,7 +91,7 @@ def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=1
     try:
         chol_matrix = cholesky(cov_matrix, lower=True)
     except:
-        st.warning("Cov matrix not PSD – using diagonal fallback")
+        st.warning("Cov matrix not PSD – using diagonal")
         cov_matrix = np.diag(vol_vector**2)
         chol_matrix = cholesky(cov_matrix, lower=True)
 
@@ -138,7 +138,7 @@ def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=1
                 term_period = period
                 redemption = 1.0
                 autocall_count += 1
-                break  # stop coupons
+                break
 
         if not terminated:
             worst = np.min(full_paths[-1])
@@ -222,8 +222,8 @@ with st.form("inputs"):
     equicorr_override = st.slider("Equicorrelation override (0 = historical)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
 
     if product == "FCN (Fixed Coupon Note)":
-        # No user input for fixed coupon in FCN — yield is the implied rate
-        fixed_coupon = 0.05  # internal default
+        # No user input for fixed coupon in FCN — yield is implied coupon
+        fixed_coupon = 0.05  # internal
         bonus_barrier = 1.0
         bonus_coupon = 0.0
     else:
@@ -246,14 +246,9 @@ if submitted:
     else:
         with st.spinner("Fetching data and running simulations..."):
             try:
-                if product == "FCN (Fixed Coupon Note)":
-                    results = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
-                                         sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
-                                         bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
-                else:
-                    results = price_note("BCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
-                                         sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
-                                         bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
+                results = price_note(product, tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
+                                     sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                     bonus_barrier, fixed_coupon, bonus_coupon)
 
                 st.success(f"Implied Annualized Yield p.a.: **{results['yield_pa']*100:.2f}%**")
 
@@ -287,24 +282,10 @@ if submitted:
 
                         table_data = []
                         for level in levels:
-                            if product == "FCN (Fixed Coupon Note)":
-                                if sensitivity_param == "KO barrier":
-                                    res = price_note("FCN", tickers, tenor, freq, non_call_periods, level, put_strike, rf,
-                                                     max(3000, sims // 3), lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
-                                                     bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
-                                else:
-                                    res = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, level, rf,
-                                                     max(3000, sims // 3), lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
-                                                     bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
-                            else:
-                                if sensitivity_param == "KO barrier":
-                                    res = price_note("BCN", tickers, tenor, freq, non_call_periods, level, put_strike, rf,
-                                                     max(3000, sims // 3), lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
-                                                     bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
-                                else:
-                                    res = price_note("BCN", tickers, tenor, freq, non_call_periods, ko_barrier, level, rf,
-                                                     max(3000, sims // 3), lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
-                                                     bonus_barrier=bonus_barrier, fixed_coupon=fixed_coupon, bonus_coupon=bonus_coupon)
+                            res = price_note(product, tickers, tenor, freq, non_call_periods, level if sensitivity_param == "KO barrier" else ko_barrier,
+                                             level if sensitivity_param == "Put strike" else put_strike, rf,
+                                             max(3000, sims // 3), lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                             bonus_barrier, fixed_coupon, bonus_coupon)
 
                             table_data.append({
                                 param_name: f"{level:.0%}",
