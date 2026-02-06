@@ -6,10 +6,9 @@ import plotly.express as px
 
 st.set_page_config(page_title="Institutional FCN Pricer", layout="wide")
 
-# --- STEP 1: CACHE ONLY THE RAW DATA ---
+# --- CORE DATA ENGINE ---
 @st.cache_data(ttl=3600)
 def fetch_market_prices(tickers):
-    """Only fetches prices and returns. No pricing logic here."""
     data_list = []
     for t in tickers:
         s = yf.Ticker(t)
@@ -18,36 +17,32 @@ def fetch_market_prices(tickers):
     df = pd.concat(data_list, axis=1).dropna()
     return df, df.pct_change().corr().values
 
-# --- STEP 2: DYNAMIC VOLATILITY CALCULATOR (NO CACHE) ---
-def get_current_vols(tickers, source="IV"):
+def get_live_vols(tickers, source="IV"):
     vols = []
     for t in tickers:
         s = yf.Ticker(t)
+        hist = s.history(period="12mo")['Close']
+        hv = hist.pct_change().std() * np.sqrt(252)
         if source == "Market Implied (IV)":
             try:
-                px_curr = s.history(period="1d")['Close'].iloc[-1]
+                px_curr = hist.iloc[-1]
                 opts = s.options
                 chain = s.option_chain(opts[min(len(opts)-1, 4)])
                 calls = chain.calls
                 vols.append(calls.iloc[(calls['strike'] - px_curr).abs().argsort()[:1]]['impliedVolatility'].values[0])
             except:
-                vols.append(s.history(period="12mo")['Close'].pct_change().std() * np.sqrt(252))
+                vols.append(hv)
         else:
-            vols.append(s.history(period="12mo")['Close'].pct_change().std() * np.sqrt(252))
+            vols.append(hv)
     return np.array(vols)
 
-# --- STEP 3: PATH GENERATION (FORCE RERUN) ---
 def generate_paths(sims, tenor, rf, base_vols, corr, skew):
-    # CRITICAL: Apply Skew here so it affects every path
     adj_vols = base_vols * (1 + skew)
     dt = 1/252
     steps = int(tenor * 252)
     L = np.linalg.cholesky(corr + np.eye(len(corr)) * 1e-8)
-    
-    # New random seed every time to ensure movement
     z = np.random.standard_normal((steps, sims, len(base_vols)))
     epsilon = np.einsum('ij,tkj->tki', L, z)
-    
     drift = (rf - 0.5 * adj_vols**2) * dt
     diffusion = adj_vols * np.sqrt(dt) * epsilon
     paths = np.exp(np.cumsum(drift + diffusion, axis=0))
@@ -75,9 +70,14 @@ def price_fcn_logic(coupon_pa, paths, r, tenor, strike, ko, freq_m, nc_m):
         final_px = worst_of[-1, active]
         payoffs[active] = np.where(final_px >= strike, 100, final_px) + (coupons[active] * cpn_val)
         
-    return np.mean(payoffs) * np.exp(-r * tenor), np.mean(coupons), (np.sum(active & (worst_of[-1] < strike))/n_sims)*100
+    return {
+        "price": np.mean(payoffs) * np.exp(-r * tenor),
+        "avg_c": np.mean(coupons),
+        "p_loss": (np.sum(active & (worst_of[-1] < strike))/n_sims)*100,
+        "p_ko": np.mean(~active) * 100
+    }
 
-# --- UI (UNTOUCHED PER REQUEST) ---
+# --- UI LAYOUT ---
 st.title("🛡️ Institutional Fixed Coupon Note (FCN) Pricer")
 
 with st.sidebar:
@@ -86,32 +86,54 @@ with st.sidebar:
     tickers = [x.strip().upper() for x in tk_in.split(",")]
     vol_source = st.radio("Volatility Input", ["Market Implied (IV)", "Historical (HV)"])
     skew_val = st.slider("Volatility Skew Factor", 0.0, 1.0, 0.2)
-    
+    rf_rate = st.number_input("Risk Free Rate %", 0.0, 10.0, 4.5) / 100
+
     st.header("2. Note Structure")
     tenor_y = st.number_input("Tenor (Years)", 0.5, 3.0, 1.0)
     freq_m = st.selectbox("Coupon Frequency (Months)", [1, 3, 6], index=0)
     nc_m = st.number_input("Non-Call Period (Months)", 0, 12, 3)
     strike_p = st.number_input("Put Strike %", 40, 100, 60)
     ko_p = st.number_input("KO Barrier %", 70, 150, 100)
-    rf_rate = st.number_input("Risk Free Rate %", 0.0, 10.0, 4.5) / 100
 
 if st.button("Generate FCN Valuation"):
-    # Clear cache only for the solve to ensure Skew is picked up
     prices_df, corr = fetch_market_prices(tickers)
-    base_vols = get_current_vols(tickers, source="Market Implied (IV)" if "IV" in vol_source else "HV")
+    base_vols = get_live_vols(tickers, source="Market Implied (IV)" if "IV" in vol_source else "HV")
+    paths = generate_paths(10000, tenor_y, rf_rate, base_vols, corr, skew_val)
     
-    # Generate paths with the Skew Applied
-    paths = generate_paths(15000, tenor_y, rf_rate, base_vols, corr, skew_val)
-    
-    # Dense Solver
-    cpns = np.linspace(0.0, 1.0, 60)
-    sim_prices = [price_fcn_logic(c, paths, rf_rate, tenor_y, strike_p, ko_p, freq_m, nc_m)[0] for c in cpns]
+    # Solver for 100 Par
+    cpns = np.linspace(0.0, 0.8, 40)
+    sim_prices = [price_fcn_logic(c, paths, rf_rate, tenor_y, strike_p, ko_p, freq_m, nc_m)['price'] for c in cpns]
     y_solve = np.interp(100.0, sim_prices, cpns)
-    
-    final_px, avg_c, p_loss = price_fcn_logic(y_solve, paths, rf_rate, tenor_y, strike_p, ko_p, freq_m, nc_m)
+    res = price_fcn_logic(y_solve, paths, rf_rate, tenor_y, strike_p, ko_p, freq_m, nc_m)
 
-    st.header(f"Solved Annual Yield: {y_solve*100:.2f}% p.a.")
+    # Main Dashboard
+    st.subheader(f"Solved Annual Yield: {y_solve*100:.2f}% p.a.")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Avg. Coupons", f"{avg_c:.2f}")
-    c2.metric("Prob. Capital Loss", f"{p_loss:.1f}%")
-    c3.metric("Selected Vol (Avg)", f"{np.mean(base_vols)*(1+skew_val):.2%}")
+    c1.metric("Prob. of Early KO", f"{res['p_ko']:.1f}%")
+    c2.metric("Prob. of Capital Loss", f"{res['p_loss']:.1f}%")
+    c3.metric("Avg. Coupons Paid", f"{res['avg_c']:.2f}")
+
+    # Sensitivity Tables
+    st.divider()
+    st.write("### 📊 Structure Sensitivity Analysis")
+    
+    strikes = [strike_p-10, strike_p-5, strike_p, strike_p+5, strike_p+10]
+    barriers = [ko_p+10, ko_p+5, ko_p, ko_p-5, ko_p-10]
+    
+    y_grid, l_grid = [], []
+    for b in barriers:
+        yr, lr = [], []
+        for s in strikes:
+            # High-speed interpolation for the grid
+            y_c = np.interp(100.0, [price_fcn_logic(c, paths, rf_rate, tenor_y, s, b, freq_m, nc_m)['price'] for c in [0, 0.4, 0.8]], [0, 0.4, 0.8])
+            yr.append(y_c * 100)
+            lr.append(price_fcn_logic(y_c, paths, rf_rate, tenor_y, s, b, freq_m, nc_m)['p_loss'])
+        y_grid.append(yr); l_grid.append(lr)
+
+    st.write("**Yield Sensitivity Matrix (% p.a.)**")
+    df_y = pd.DataFrame(y_grid, index=[f"KO {b}%" for b in barriers], columns=[f"Strike {s}%" for s in strikes])
+    st.dataframe(df_y.style.background_gradient(cmap='RdYlGn').format("{:.2f}"), use_container_width=True)
+
+    st.write("**Capital Loss Probability Matrix (%)**")
+    df_l = pd.DataFrame(l_grid, index=[f"KO {b}%" for b in barriers], columns=[f"Strike {s}%" for s in strikes])
+    st.dataframe(df_l.style.background_gradient(cmap='Reds').format("{:.1f}"), use_container_width=True)
