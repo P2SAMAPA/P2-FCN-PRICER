@@ -91,7 +91,7 @@ def price_note(product, tickers, tenor, freq, non_call, KO, strike, rf, n_sims=1
     try:
         chol_matrix = cholesky(cov_matrix, lower=True)
     except:
-        st.warning("Cov matrix not PSD – using diagonal")
+        st.warning("Cov matrix not PSD – using diagonal fallback")
         cov_matrix = np.diag(vol_vector**2)
         chol_matrix = cholesky(cov_matrix, lower=True)
 
@@ -222,7 +222,7 @@ with st.form("inputs"):
     equicorr_override = st.slider("Equicorrelation override (0 = historical)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
 
     if product == "FCN (Fixed Coupon Note)":
-        # No user input for fixed coupon in FCN — yield is implied coupon
+        # No user input for fixed coupon in FCN — yield is implied
         fixed_coupon = 0.05  # internal
         bonus_barrier = 1.0
         bonus_coupon = 0.0
@@ -246,9 +246,14 @@ if submitted:
     else:
         with st.spinner("Fetching data and running simulations..."):
             try:
-                results = price_note(product, tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
-                                     sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
-                                     bonus_barrier, fixed_coupon, bonus_coupon)
+                if product == "FCN (Fixed Coupon Note)":
+                    results = price_note("FCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
+                                         sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                         bonus_barrier, fixed_coupon, bonus_coupon)
+                else:
+                    results = price_note("BCN", tickers, tenor, freq, non_call_periods, ko_barrier, put_strike, rf,
+                                         sims, lookback_months, iv_maturity_days, use_implied_vol, skew_factor, equicorr_override,
+                                         bonus_barrier, fixed_coupon, bonus_coupon)
 
                 st.success(f"Implied Annualized Yield p.a.: **{results['yield_pa']*100:.2f}%**")
 
