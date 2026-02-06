@@ -3,155 +3,154 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
-import plotly.express as px
-from scipy.stats import norm
+from scipy.optimize import brentq
+from datetime import datetime
 
-st.set_page_config(page_title="FCN & BCN Structure Pricer", layout="wide")
+st.set_page_config(page_title="Institutional FCN/BCN Solver", layout="wide")
 
-# --- CORE MATH FUNCTIONS ---
-def get_historical_data(tickers, months):
-    end_date = pd.Timestamp.now()
-    start_date = end_date - pd.DateOffset(months=months)
-    data = yf.download(tickers, start=start_date, end=end_date)['Close']
+# --- DATA & VOLATILITY FUNCTIONS ---
+@st.cache_data(ttl=3600)
+def get_market_params(tickers, lookback_months):
+    vols = []
+    prices = []
+    for t in tickers:
+        stock = yf.Ticker(t)
+        # Get Implied Vol from ATM Options
+        try:
+            current_price = stock.history(period="1d")['Close'].iloc[-1]
+            prices.append(current_price)
+            opt_dates = stock.options
+            chain = stock.option_chain(opt_dates[0])
+            atm_iv = chain.calls.iloc[(chain.calls['strike'] - current_price).abs().argsort()[:1]]['impliedVolatility'].values[0]
+            vols.append(atm_iv)
+        except:
+            vols.append(0.25) # Fallback
     
-    returns = np.log(data / data.shift(1)).dropna()
-    vols = returns.std() * np.sqrt(252)
-    corr = returns.corr()
-    return vols, corr
-
-def run_monte_carlo(n_sims, n_steps, n_assets, T, r, vols, corr_matrix, skew, strike_pct):
-    dt = T / n_steps
-    # Adjust vol for skew: Vol_adj = Vol + Skew * (Strike - 100)
-    # Note: Strike is usually < 100, so a negative skew increases vol for lower strikes
-    adj_vols = vols + (skew * (strike_pct - 100) / 100)
+    # Get Correlation from Historical Data
+    end = datetime.now()
+    start = end - pd.DateOffset(months=lookback_months)
+    hist_data = yf.download(tickers, start=start, end=end)['Close']
+    corr_matrix = hist_data.pct_change().corr().values
     
-    # Cholesky for correlation
+    return np.array(vols), corr_matrix
+
+# --- SIMULATION ENGINE ---
+def run_simulation(n_sims, n_assets, tenor, r, vols, corr_matrix, skew, strike_pct):
+    dt = 1/252
+    steps = int(tenor * 252)
     L = np.linalg.cholesky(corr_matrix)
     
-    # Simulate paths
-    # Result shape: [steps, sims, assets]
-    paths = np.zeros((n_steps + 1, n_sims, n_assets))
-    paths[0] = 100.0 # Standardized start
+    # Apply Skew: Vol increases as strike decreases
+    # adj_vol = Base_Vol + Skew * (100 - Strike)
+    adj_vols = vols + (skew/100 * (100 - strike_pct)/100)
     
-    for t in range(1, n_steps + 1):
-        z = np.random.standard_normal((n_sims, n_assets))
-        correlated_z = z @ L.T
+    paths = np.zeros((steps + 1, n_sims, n_assets))
+    paths[0] = 100.0
+    
+    for t in range(1, steps + 1):
+        z = np.random.standard_normal((n_sims, n_assets)) @ L.T
         drift = (r - 0.5 * adj_vols**2) * dt
-        diffusion = adj_vols * np.sqrt(dt) * correlated_z
+        diffusion = adj_vols * np.sqrt(dt) * z
         paths[t] = paths[t-1] * np.exp(drift + diffusion)
-        
-    return paths
-
-# --- APP INTERFACE ---
-st.title("🛡️ Structured Product Pricer: FCN & BCN")
-st.markdown("Worst-of Basket Pricing Engine with Monte Carlo Simulation")
-
-with st.sidebar:
-    st.header("1. Global Parameters")
-    product_type = st.selectbox("Product Type", ["FCN (Fixed Coupon)", "BCN (Bonus Coupon)"])
-    tickers = st.text_input("Tickers (comma separated)", "AAPL, MSFT, GOOGL").split(",")
-    tickers = [t.strip() for t in tickers]
     
-    vol_mode = st.radio("Volatility Mode", ["Implied (Manual)", "Historical"])
-    if vol_mode == "Historical":
-        lookback = st.slider("Lookback Period (Months)", 1, 60, 12)
-        vols_data, corr_matrix = get_historical_data(tickers, lookback)
-        st.write("Calculated Annualized Vols:")
-        st.write(vols_data)
-    else:
-        manual_vol = st.number_input("Flat Implied Vol (%)", value=25.0) / 100
-        vols_data = np.array([manual_vol] * len(tickers))
-        corr_val = st.slider("Fixed Correlation", -1.0, 1.0, 0.5)
-        corr_matrix = np.full((len(tickers), len(tickers)), corr_val)
-        np.fill_diagonal(corr_matrix, 1.0)
+    return np.min(paths, axis=2) # Worst-of paths
 
-    st.header("2. Note Features")
-    tenor = st.number_input("Tenor (Years)", value=1.0)
-    strike_pct = st.number_input("Put Strike / KI Barrier (%)", value=80.0)
-    ko_barrier = st.number_input("KO Barrier (%)", value=105.0)
-    coupon_freq = st.selectbox("Coupon Frequency (Months)", [1, 3, 6], index=0)
-    non_call = st.number_input("Non-Call Period (Months)", value=3)
+def price_engine(coupon_pa, wo_paths, tenor, r, strike_pct, ko_barrier, freq_months, nc_months, is_bcn, bonus=0):
+    steps, n_sims = wo_paths.shape
+    dt = 1/252
+    obs_freq = int(252 * (freq_months/12))
+    nc_step = int(252 * (nc_months/12))
     
-    st.header("3. Pricing Logic")
-    r = st.number_input("Risk Free Rate (%)", value=4.5) / 100
-    skew = st.number_input("Volatility Skew (bps per 1% Strike)", value=0.5) / 100
-    n_sims = st.select_slider("Simulations", options=[1000, 5000, 10000], value=5000)
-
-    if product_type == "FCN (Fixed Coupon)":
-        coupon_pa = st.number_input("Fixed Coupon (% p.a.)", value=10.0) / 100
-        bonus_coupon = 0.0
-    else:
-        coupon_pa = st.number_input("Fixed Coupon (% p.a.)", value=5.0) / 100
-        bonus_coupon = st.number_input("At-Maturity Bonus (%)", value=3.0) / 100
-
-# --- COMPUTATION ---
-if st.button("Calculate Note Value"):
-    n_steps = int(tenor * 252)
-    paths = run_monte_carlo(n_sims, n_steps, len(tickers), tenor, r, vols_data.values if vol_mode == "Historical" else vols_data, corr_matrix, skew, strike_pct)
-    
-    # Calculate Worst-of paths
-    wo_paths = np.min(paths, axis=2) # Shape: [steps, sims]
-    
-    # Observation logic
-    obs_steps = np.arange(0, n_steps + 1, int(252 * (coupon_freq/12)))
-    non_call_step = int(252 * (non_call/12))
-    
-    total_payoffs = np.zeros(n_sims)
-    ko_count = 0
+    payoffs = np.zeros(n_sims)
+    coupon_per_obs = (coupon_pa * (freq_months/12)) * 100
     
     for i in range(n_sims):
         path = wo_paths[:, i]
-        ko_event = False
-        coupons_paid = 0
+        ko_idx = np.where((path[nc_step:] >= ko_barrier))[0]
         
-        for step in obs_steps[1:]:
-            # Check for KO
-            if step >= non_call_step and path[step] >= ko_barrier:
-                ko_event = True
-                total_payoffs[i] = 100 + (coupons_paid + 1) * (coupon_pa * (coupon_freq/12) * 100)
-                ko_count += 1
-                break
-            # Pay regular coupon
-            coupons_paid += 1
-            
-        if not ko_event:
+        if len(ko_idx) > 0:
+            actual_ko_step = ko_idx[0] + nc_step
+            # Count coupons up to KO
+            num_coupons = (actual_ko_step // obs_freq)
+            payoffs[i] = 100 + (num_coupons * coupon_per_obs)
+        else:
             # Maturity Payoff
-            final_perf = path[-1]
-            principal = 100 if final_perf >= strike_pct else final_perf
-            total_coupons = coupons_paid * (coupon_pa * (coupon_freq/12) * 100)
-            bonus = (bonus_coupon * 100) if product_type == "BCN (Bonus Coupon)" else 0
-            total_payoffs[i] = principal + total_coupons + bonus
+            principal = 100 if path[-1] >= strike_pct else path[-1]
+            num_coupons = (steps // obs_freq)
+            b_payoff = (bonus * 100) if is_bcn else 0
+            payoffs[i] = principal + (num_coupons * coupon_per_obs) + b_payoff
+            
+    return np.mean(payoffs) * np.exp(-r * tenor)
 
-    fair_value = np.exp(-r * tenor) * np.mean(total_payoffs)
-    ann_yield = ((np.mean(total_payoffs) / 100) - 1) / tenor
+# --- UI LAYOUT ---
+st.title("🛡️ Worst-of FCN & BCN Solver")
 
-    # --- OUTPUTS ---
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Fair Value", f"{fair_value:.2f}%")
-    col2.metric("Est. Annualized Yield", f"{ann_yield*100:.2f}%")
-    col3.metric("KO Probability", f"{(ko_count/n_sims)*100:.1f}%")
+with st.sidebar:
+    st.header("1. Assets & Volatility")
+    ticker_input = st.text_input("Tickers (CSV)", "AAPL, MSFT, TSLA")
+    tickers = [x.strip() for x in ticker_input.split(",")]
+    vol_mode = st.radio("Vol Source", ["Market Implied", "Historical"])
+    lookback = st.number_input("Hist. Lookback (Months)", 1, 60, 12)
+    skew = st.slider("Volatility Skew (bps per 1% Strike)", 0.0, 2.0, 0.8)
+    
+    st.header("2. Product Features")
+    p_type = st.selectbox("Product Type", ["FCN", "BCN"])
+    tenor = st.number_input("Tenor (Years)", 0.1, 3.0, 1.0)
+    strike_input = st.number_input("Put Strike %", 50, 100, 80)
+    ko_input = st.number_input("KO Barrier %", 80, 150, 105)
+    freq = st.selectbox("Coupon Frequency (Months)", [1, 3, 6])
+    nc = st.number_input("Non-Call Period (Months)", 0, 12, 3)
+    
+    if p_type == "BCN":
+        f_coupon = st.number_input("Fixed Coupon % p.a.", 0.0, 20.0, 5.0) / 100
+        b_coupon = st.number_input("Bonus Coupon %", 0.0, 10.0, 2.0) / 100
+
+    n_sims = st.select_slider("Simulations", [1000, 5000, 10000, 20000], value=5000)
+    r_rate = st.number_input("Risk Free Rate %", 0.0, 10.0, 4.0) / 100
+
+if st.button("Run Solver"):
+    vols, corr = get_market_params(tickers, lookback)
+    wo_paths = run_simulation(n_sims, len(tickers), tenor, r_rate, vols, corr, skew, strike_input)
+    
+    if p_type == "FCN":
+        st.subheader("FCN Results")
+        # Solve for coupon where Price = 100
+        obj = lambda x: price_engine(x, wo_paths, tenor, r_rate, strike_input, ko_input, freq, nc, False) - 100
+        try:
+            yield_sol = brentq(obj, 0.0, 0.6)
+            st.metric("Solved Annualized Yield", f"{yield_sol*100:.2f}% p.a.")
+        except:
+            st.error("Solver could not converge. Try adjusting barriers.")
+    else:
+        st.subheader("BCN Results")
+        price = price_engine(f_coupon, wo_paths, tenor, r_rate, strike_input, ko_input, freq, nc, True, b_coupon)
+        st.metric("Note Fair Value", f"{price:.2f}%")
 
     # --- SENSITIVITY TABLE ---
-    st.subheader("Sensitivity Analysis (Annualized Yield %)")
+    st.write("---")
+    st.subheader("Sensitivity: Annualized Yield vs Strike & KO")
     
-    strikes = [strike_pct * x for x in [0.9, 0.95, 1.0, 1.05, 1.1]]
-    kos = [ko_barrier * x for x in [0.9, 0.95, 1.0, 1.05, 1.1]]
+    s_range = [strike_input - 10, strike_input - 5, strike_input, strike_input + 5, strike_input + 10]
+    k_range = [ko_input + 10, ko_input + 5, ko_input, ko_input - 5, ko_input - 10]
     
-    sens_data = np.zeros((len(kos), len(strikes)))
-    for r_idx, k in enumerate(kos):
-        for c_idx, s in enumerate(strikes):
-            # Simplified sensitivity: adjusting yield linearly for display
-            sens_data[r_idx, c_idx] = ann_yield * 100 * (s/strike_pct) * (ko_barrier/k)
-
-    sens_df = pd.DataFrame(sens_data, index=[f"KO {x:.0f}%" for x in kos], columns=[f"Strike {x:.0f}%" for x in strikes])
-    st.table(sens_df.style.background_gradient(cmap='RdYlGn'))
+    results = []
+    for k in k_range:
+        row = []
+        for s in s_range:
+            # Quick solve for sensitivity (using 1/2 sims for speed)
+            obj_sens = lambda x: price_engine(x, wo_paths[:, :n_sims//2], tenor, r_rate, s, k, freq, nc, False) - 100
+            try:
+                row.append(round(brentq(obj_sens, 0.0, 0.8) * 100, 2))
+            except:
+                row.append(np.nan)
+        results.append(row)
+    
+    df_sens = pd.DataFrame(results, index=[f"KO {i}%" for i in k_range], columns=[f"Strike {j}%" for j in s_range])
+    st.table(df_sens.style.background_gradient(cmap='RdYlGn'))
 
     # Path Visualization
-    st.subheader("Sample Worst-of Path Simulation")
     fig = go.Figure()
-    for i in range(min(10, n_sims)):
-        fig.add_trace(go.Scatter(y=wo_paths[:, i], mode='lines', opacity=0.4, showlegend=False))
-    
-    fig.add_hline(y=ko_barrier, line_dash="dash", line_color="green", annotation_text="KO Barrier")
-    fig.add_hline(y=strike_pct, line_dash="dash", line_color="red", annotation_text="Put Strike")
-    st.plotly_chart(fig, use_container_width=True)
+    for i in range(15):
+        fig.add_trace(go.Scatter(y=wo_paths[:, i], mode='lines', opacity=0.3))
+    fig.update_layout(title="Worst-of Sample Paths", xaxis_title="Days", yaxis_title="Level (%)")
+    st.plotly_chart(fig)
