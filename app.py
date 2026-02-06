@@ -14,17 +14,32 @@ def get_market_data(tickers, lookback):
     for t in tickers:
         s = yf.Ticker(t)
         try:
+            # Get current price to find ATM options
             px = s.history(period="1d")['Close'].iloc[-1]
             opts = s.options
-            idx = min(len(opts)-1, 4)
-            chain = s.option_chain(opts[idx])
-            iv = chain.calls.iloc[(chain.calls['strike'] - px).abs().argsort()[:1]]['impliedVolatility'].values[0]
-            vols.append(iv)
-        except: vols.append(0.35)
+            # Focus on mid-term options (3-6 months) for more stable IV
+            target_idx = min(len(opts)-1, 5) 
+            chain = s.option_chain(opts[target_idx])
+            
+            # Find the option closest to current price (ATM)
+            atm_iv = chain.calls.iloc[(chain.calls['strike'] - px).abs().argsort()[:1]]['impliedVolatility'].values[0]
+            
+            # SANITY CHECK: yfinance sometimes returns IV > 100% for stable stocks erroneously
+            # We cap it at a realistic 100% and floor it at 10%
+            vols.append(max(0.10, min(1.0, atm_iv)))
+        except: 
+            vols.append(0.20) # Conservative default for GLD/Stable assets
     
     start = datetime.now() - pd.DateOffset(months=lookback)
     h = yf.download(tickers, start=start, end=datetime.now(), progress=False)['Close']
-    corr = h.pct_change().dropna().corr().values
+    
+    # Handle single ticker case for correlation
+    if len(tickers) > 1:
+        corr = h.pct_change().dropna().corr().values
+    else:
+        corr = np.array([[1.0]])
+        
+    # Matrix robustness
     if np.linalg.cond(corr) > 1/np.finfo(corr.dtype).eps:
         corr = corr + np.eye(len(tickers)) * 1e-6
     return np.array(vols), corr
@@ -63,6 +78,7 @@ def run_valuation(coupon, paths, r, tenor, strike, ko, freq_m, nc_m):
 def get_wo_paths(sims, tks, t_yr, rf, vols, corr, strike_val, skew_bps):
     L = np.linalg.cholesky(corr)
     dt, steps = 1/252, int(t_yr * 252)
+    # Apply skew relative to Strike OTM-ness
     adj_vols = vols * (1 + (skew_bps/10000) * (100 - strike_val))
     raw = np.zeros((steps + 1, sims, len(tks)))
     raw[0] = 100.0
@@ -72,43 +88,48 @@ def get_wo_paths(sims, tks, t_yr, rf, vols, corr, strike_val, skew_bps):
     return np.min(raw, axis=2)
 
 def solve_yield(paths, r, tenor, strike, ko, freq_m, nc_m):
+    # Search range for coupon to find Par (100)
     p1 = run_valuation(0.01, paths, r, tenor, strike, ko, freq_m, nc_m)['price']
-    p2 = run_valuation(0.40, paths, r, tenor, strike, ko, freq_m, nc_m)['price']
-    return 0.01 + (100 - p1) * (0.40 - 0.01) / (p2 - p1)
+    p2 = run_valuation(0.30, paths, r, tenor, strike, ko, freq_m, nc_m)['price']
+    return 0.01 + (100 - p1) * (0.30 - 0.01) / (p2 - p1)
 
 # --- UI ---
 st.title("🛡️ Institutional FCN Solver")
 
 with st.sidebar:
-    tickers = [x.strip().upper() for x in st.text_input("Tickers", "AAPL, MSFT, TSLA").split(",")]
+    st.header("Asset Settings")
+    tickers = [x.strip().upper() for x in st.text_input("Tickers (e.g. GLD)", "GLD").split(",")]
     sims = st.select_slider("Simulations", [5000, 10000], 5000)
-    rf = st.number_input("Risk Free %", 0.0, 10.0, 4.5) / 100
-    skew = st.slider("Dynamic Skew (bps)", 0, 300, 120)
+    rf = st.number_input("Risk Free Rate %", 0.0, 10.0, 4.5) / 100
+    skew = st.slider("Volatility Skew (bps)", 0, 300, 50) # Reduced default skew for GLD
     st.divider()
-    tenor = st.number_input("Tenor (Y)", 0.1, 5.0, 1.0)
-    freq = st.selectbox("Coupon Freq (M)", [1, 3, 6])
-    nc = st.number_input("Non-Call (M)", 0, 12, 3)
-    strike_p = st.number_input("Base Strike %", 40, 100, 60)
-    ko_p = st.number_input("Base KO Barrier %", 70, 150, 105)
+    st.header("Product Parameters")
+    tenor = st.number_input("Tenor (Years)", 0.1, 5.0, 1.0)
+    freq = st.selectbox("Coupon Frequency (M)", [1, 3, 6])
+    nc = st.number_input("Non-Call Period (M)", 0, 12, 3)
+    strike_p = st.number_input("Strike Price %", 40, 100, 60)
+    ko_p = st.number_input("KO Barrier %", 70, 150, 100)
 
-if st.button("Solve FCN"):
-    vols, corr = get_market_data(tickers, 12)
-    
-    # 1. SOLVE MAIN CASE FIRST
-    with st.status("Calculating Primary Solution...", expanded=True) as status:
+if st.button("Calculate Yields"):
+    with st.spinner("Fetching market data and running Monte Carlo..."):
+        vols, corr = get_market_data(tickers, 12)
+        
+        # Display the IV used so the user knows if it's realistic
+        st.info(f"Using Market Implied Vol: {vols[0]*100:.1f}%")
+        
+        # 1. SOLVE MAIN CASE
         wo_main = get_wo_paths(sims, tickers, tenor, rf, vols, corr, strike_p, skew)
         main_y = solve_yield(wo_main, rf, tenor, strike_p, ko_p, freq, nc)
         main_res = run_valuation(main_y, wo_main, rf, tenor, strike_p, ko_p, freq, nc)
         
-        # DISPLAY MAIN RESULT AT THE TOP
-        st.header(f"Target Annualized Yield: {main_y*100:.2f}% p.a.")
+        st.header(f"Solved Annualized Yield: {main_y*100:.2f}% p.a.")
         c1, c2, c3 = st.columns(3)
         c1.metric("Prob. of KO", f"{main_res['prob_ko']*100:.1f}%")
         c2.metric("Prob. of Capital Loss", f"{main_res['prob_ki']*100:.1f}%")
         c3.metric("Avg. Coupons Paid", f"{main_res['avg_cpn']:.2f}")
-        
-        # 2. GENERATE SENSITIVITY GRID
-        status.update(label="Generating Sensitivity Matrix...", state="running")
+
+        # 2. SENSITIVITY GRID
+        st.divider()
         ss = [strike_p-10, strike_p-5, strike_p, strike_p+5, strike_p+10]
         kk = [ko_p+10, ko_p+5, ko_p, ko_p-5, ko_p-10]
         y_grid, ko_grid, ki_grid = [], [], []
@@ -121,17 +142,15 @@ if st.button("Solve FCN"):
                 res = run_valuation(y, wo, rf, tenor, sv, kv, freq, nc)
                 y_r.append(y*100); ko_r.append(res['prob_ko']*100); ki_r.append(res['prob_ki']*100)
             y_grid.append(y_r); ko_grid.append(ko_r); ki_grid.append(ki_r)
-        status.update(label="Calculation Complete", state="complete")
 
-    # 3. DISPLAY SENSITIVITY TABLES
-    st.divider()
-    st.subheader("Yield Sensitivity Table (% p.a.)")
-    st.dataframe(pd.DataFrame(y_grid, index=kk, columns=ss).style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2f}"))
-    
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.write("**Prob. of KO (%)**")
-        st.dataframe(pd.DataFrame(ko_grid, index=kk, columns=ss).style.background_gradient(cmap='Blues', axis=None).format("{:.1f}"))
-    with col_b:
-        st.write("**Prob. of Capital Loss (%)**")
-        st.dataframe(pd.DataFrame(ki_grid, index=kk, columns=ss).style.background_gradient(cmap='Reds', axis=None).format("{:.1f}"))
+        st.subheader("Yield Sensitivity (% p.a.)")
+        st.dataframe(pd.DataFrame(y_grid, index=kk, columns=ss).style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2f}"))
+        
+        st.subheader("Risk Metrics")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.write("**Prob. of KO (%)**")
+            st.dataframe(pd.DataFrame(ko_grid, index=kk, columns=ss).style.background_gradient(cmap='Blues', axis=None).format("{:.1f}"))
+        with col_b:
+            st.write("**Prob. of Capital Loss (%)**")
+            st.dataframe(pd.DataFrame(ki_grid, index=kk, columns=ss).style.background_gradient(cmap='Reds', axis=None).format("{:.1f}"))
