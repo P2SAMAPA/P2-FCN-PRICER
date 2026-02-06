@@ -1,3 +1,4 @@
+
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -52,32 +53,25 @@ def get_fcn_pv(coupon_pa, paths, r, tenor, strike, ko, freq_m, nc_m):
         payoffs[active] = np.where(final_px >= strike, 100, final_px) + accrued[active]
     return np.mean(payoffs) * np.exp(-r * tenor)
 
-# --- BCN ENGINE (SOLVES FOR KI BARRIER / STRIKE) ---
+# --- BCN ENGINE ---
 def get_bcn_pv(ki_barrier, paths, r, tenor, g_cpn, b_rate, ko, b_ref_stk, freq_m, nc_m):
     steps, n_sims, _ = paths.shape
     worst_of = np.min(paths, axis=2)
     obs_dates = np.arange(int((freq_m/12)*252), steps, int((freq_m/12)*252))
     nc_steps = int((nc_m/12)*252)
     payoffs, active = np.zeros(n_sims), np.ones(n_sims, dtype=bool)
-    
-    g_val = (g_cpn * (freq_m/12)) * 100
-    b_val = (b_rate * (freq_m/12)) * 100
+    g_val, b_val = (g_cpn * (freq_m/12)) * 100, (b_rate * (freq_m/12)) * 100
     accrued = np.zeros(n_sims)
-    
     for d in obs_dates:
         accrued[active] += g_val
-        # Bonus paid if Worst-Of >= Bonus Reference Strike
         bonus_eligible = active & (worst_of[d] >= b_ref_stk)
         accrued[bonus_eligible] += b_val
-        
         if d >= nc_steps:
             ko_mask = active & (worst_of[d] >= ko)
             payoffs[ko_mask] = 100 + accrued[ko_mask]
             active[ko_mask] = False
-            
     if np.any(active):
         final_px = worst_of[-1, active]
-        # Loss triggered if final price < KI Barrier
         payoffs[active] = np.where(final_px >= ki_barrier, 100, final_px) + accrued[active]
     return np.mean(payoffs) * np.exp(-r * tenor)
 
@@ -113,25 +107,28 @@ if mode == "FCN Pricer":
         y_solve = brentq(lambda c: get_fcn_pv(c, paths, rf, tenor, stk_fcn, ko_fcn, freq_m, nc_m) - 100, 0, 4)
         st.markdown(f"### Solved Annualized Yield: **{y_solve*100:.2f}% p.a.**")
         
-        c1, c2 = st.columns(2)
-        p_loss = (np.sum(np.min(paths[-1], axis=1) < stk_fcn) / n_sims) * 100
-        c1.metric("Prob. Capital Loss", f"{p_loss:.1f}%")
-        
+        # --- RESTORED FCN SENSITIVITY TABLES ---
         st.divider()
         st.write("### Yield Sensitivity Matrix (% p.a.)")
         stks_range = [stk_fcn-10, stk_fcn, stk_fcn+10]
         bars_range = [ko_fcn+10, ko_fcn, ko_fcn-10]
-        grid = []
+        grid_y, grid_l = [], []
         for b in bars_range:
-            row = []
+            row_y, row_l = [], []
             for s in stks_range:
                 try:
                     val = brentq(lambda c: get_fcn_pv(c, paths, rf, tenor, s, b, freq_m, nc_m) - 100, 0, 5)
-                    row.append(val * 100)
-                except: row.append(0.0)
-            grid.append(row)
-        df_res = pd.DataFrame(grid, columns=[f"Stk {s}%" for s in stks_range], index=[f"KO {b}%" for b in bars_range])
-        st.table(df_res.style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2f}"))
+                    row_y.append(val * 100)
+                except: row_y.append(0.0)
+                # Capital Loss Prob Calculation
+                row_l.append((np.sum(np.min(paths[-1], axis=1) < s) / n_sims) * 100)
+            grid_y.append(row_y)
+            grid_l.append(row_l)
+            
+        st.table(pd.DataFrame(grid_y, columns=[f"Stk {s}%" for s in stks_range], index=[f"KO {b}%" for b in bars_range]).style.background_gradient(cmap='RdYlGn'))
+        
+        st.write("### Capital Loss Probability (%)")
+        st.table(pd.DataFrame(grid_l, columns=[f"Stk {s}%" for s in stks_range], index=[f"KO {b}%" for b in bars_range]).style.background_gradient(cmap='Reds'))
 
 elif mode == "BCN Solver":
     st.markdown("## 🛡️ Institutional BCN Solver (Bonus Coupon)")
@@ -142,7 +139,6 @@ elif mode == "BCN Solver":
         vol_src_b = st.radio("Vol Source", ["Historical (HV)", "Market Implied (IV)"])
         skew_b = st.slider("Vol Skew Factor", 0.0, 1.0, 0.2)
         rf_b = st.number_input("Risk Free Rate %", 0.0, 10.0, 4.5) / 100
-        
         st.header("2. BCN Structure")
         tenor_b = st.number_input("Tenor (Years)", 0.5, 3.0, 1.0)
         freq_label_b = st.selectbox("Guaranteed Coupon Frequency", ["Monthly", "Quarterly", "Semi-Annual"])
@@ -151,7 +147,6 @@ elif mode == "BCN Solver":
         ko_b = st.slider("KO Barrier %", 80, 150, 105)
         b_ref_stk = st.slider("Bonus Reference Strike %", 100, 130, 100)
 
-    # BCN Core Inputs
     st.write("### BCN Parameters")
     c1, c2 = st.columns(2)
     g_cpn = c1.number_input("Guaranteed Coupon Rate (% p.a.)", 0.0, 20.0, 4.0) / 100
@@ -166,30 +161,14 @@ elif mode == "BCN Solver":
         eps = np.einsum('ij,tkj->tki', L, z)
         paths = np.vstack([np.ones((1, n_sims, len(vols))), np.exp(np.cumsum((rf_b - 0.5*adj_v**2)*dt + adj_v*np.sqrt(dt)*eps, axis=0))]) * 100
 
-        # Display Initial Reference Strikes
-        st.write("#### Initial Reference Strikes (Trade Date Spot)")
+        st.write("#### Initial Reference Strikes (Spot)")
         st.table(pd.DataFrame([{"Ticker": t, "Spot (100%)": f"${l_px[i]:.2f}"} for i, t in enumerate(tickers_b)]))
 
         try:
-            # Solving for KI BARRIER (STRIKE)
             ki_solve = brentq(lambda s: get_bcn_pv(s, paths, rf_b, tenor_b, g_cpn, b_rate, ko_b, b_ref_stk, freq_m_b, nc_m_b) - 100, 10.0, 100.0)
             st.metric("Required KI Barrier (Put Strike)", f"{ki_solve:.2f}%")
             
-            # Sensitivity Matrix
             st.divider()
             st.write("### KI Barrier Sensitivity (Guaranteed vs Bonus Rate)")
             g_range = [g_cpn-0.01, g_cpn, g_cpn+0.01]
-            b_range = [b_rate-0.02, b_rate, b_rate+0.02]
-            grid = []
-            for b in b_range:
-                row = []
-                for g in g_range:
-                    try:
-                        s_val = brentq(lambda s: get_bcn_pv(s, paths, rf_b, tenor_b, g, b, ko_b, b_ref_stk, freq_m_b, nc_m_b) - 100, 10.0, 150.0)
-                        row.append(s_val)
-                    except: row.append(0.0)
-                grid.append(row)
-            df_bcn_sens = pd.DataFrame(grid, columns=[f"Guar. {g*100:.1f}%" for g in g_range], index=[f"Bonus {b*100:.1f}%" for b in b_range])
-            st.table(df_bcn_sens.style.background_gradient(cmap='RdYlGn_r').format("{:.2f}"))
-        except:
-            st.error("Structure not solvable. Please adjust coupon rates or barrier expectations.")
+            b_range = [b_rate-0.02, b_rate, b_rate+0
