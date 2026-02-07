@@ -4,7 +4,7 @@ import pandas as pd
 import yfinance as yf
 from scipy.optimize import brentq
 
-# --- 1. RESTORED PROFESSIONAL UI STYLING ---
+# --- 1. RESTORED PROFESSIONAL UI STYLING (From your screenshots) ---
 st.set_page_config(page_title="Institutional Derivatives Lab", layout="wide")
 st.markdown("""
     <style>
@@ -12,23 +12,25 @@ st.markdown("""
     .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #d1d9e6; box-shadow: 2px 2px 5px rgba(0,0,0,0.05); }
     .stTable { background-color: #ffffff; border-radius: 10px; }
     .stButton>button { width: 100%; border-radius: 8px; height: 3em; background-color: #1a1c23; color: white; font-weight: bold; }
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. RESTORED INPUT UX (SIDEBAR) ---
+# --- 2. RESTORED GLOBAL CONTROLS (Sidebar exactly as per image_e25b9e) ---
 with st.sidebar:
-    st.header("⚙️ Global Controls")
+    st.title("⚙️ Global Controls")
     mode = st.selectbox("Product", ["FCN Version 1", "FCN Version 2 (Step-Down)", "BCN Solver"])
     tk_in = st.text_input("Tickers (Comma Separated)", "SPY, QQQ")
     tks = [x.strip().upper() for x in tk_in.split(",")]
     vol_src = st.radio("Volatility Source", ["Historical (HV)", "Market Implied (IV)"])
     
+    st.markdown("---")
     st.subheader("🏦 Funding & RF Rate")
+    
     @st.cache_data(ttl=3600)
     def get_rf_base():
-        try:
-            # Fetching 3-month T-Bill rate for grounding
-            return yf.Ticker("^IRX").history(period="1d")['Close'].iloc[-1] / 100
+        try: return yf.Ticker("^IRX").history(period="1d")['Close'].iloc[-1] / 100
         except: return 0.045
 
     rf_base_val = get_rf_base()
@@ -38,10 +40,10 @@ with st.sidebar:
     if "1 Year" in rf_choice: rf_rate += 0.002
     st.caption(f"Effective Rate: {rf_rate*100:.2f}%")
     
-    tenor_y = st.number_input("Tenor (Years)", 0.5, 3.0, 1.0)
+    tenor_y = st.number_input("Tenor (Years)", 0.5, 3.0, 1.0, step=0.25)
     nc_m = st.number_input("Non-Call (M)", 0, 24, 3)
 
-# --- 3. DYNAMIC PRICING ENGINE ---
+# --- 3. DYNAMIC DATA & CORRELATION ENGINE ---
 @st.cache_data(ttl=3600)
 def get_mkt_data(tks, src):
     v, p, lp, divs = [], [], [], []
@@ -62,12 +64,12 @@ def get_mkt_data(tks, src):
         except: continue
     if not p: return None, None, None, None, []
     df = pd.concat(p, axis=1).dropna()
-    corr = df.pct_change().corr().values # Dynamic correlation
+    corr = df.pct_change().corr().values # Restored dynamic correlation
     return np.array(v), corr, np.array(lp), np.array(divs), valid_names
 
 def run_pricing_logic(cpn_pa, paths, r, tenor, stk, ko, f_m, nc_m, mode, sd=0, b_r=0, b_f=0):
     steps, n_s, n_a = paths.shape
-    wf = np.min(paths, axis=2) # Worst-of logic
+    wf = np.min(paths, axis=2) 
     obs = np.arange(int((f_m/12)*252), steps, int((f_m/12)*252))
     py, act, acc = np.zeros(n_s), np.ones(n_s, dtype=bool), np.zeros(n_s)
     cpn_cnt = np.zeros(n_s)
@@ -89,7 +91,7 @@ def run_pricing_logic(cpn_pa, paths, r, tenor, stk, ko, f_m, nc_m, mode, sd=0, b
             py[act] = np.where(f_p >= stk, 100, f_p) + acc[act]
     return np.mean(py) * np.exp(-r * tenor), np.mean(cpn_cnt), (np.sum(wf[-1] < stk)/n_s)
 
-# --- 4. RESTORED OUTPUT UX ---
+# --- 4. RESTORED OUTPUT UX (Main Screen exactly as per image_e2515c) ---
 if len(tks) >= 1:
     v, corr, spots, divs, names = get_mkt_data(tks, vol_src)
     if names:
@@ -104,6 +106,7 @@ if len(tks) >= 1:
 
         st.title(f"🛡️ {mode} Analysis")
         
+        # Product UI Elements
         if "BCN" in mode:
             c1, c2 = st.columns(2)
             g_cpn = c1.number_input("Guaranteed Rate %", 0.0, 20.0, 4.0)/100
@@ -112,13 +115,12 @@ if len(tks) >= 1:
             fq_val = st.selectbox("Frequency", ["Monthly", "Quarterly"])
             fq = 1 if fq_val == "Monthly" else 3
             if st.button("Solve Required Barrier"):
-                v_min = run_pricing_logic(g_cpn, ps, rf_rate, tenor_y, 40, 100, fq, nc_m, mode, b_r=b_rate, b_f=b_ref)[0]
-                v_max = run_pricing_logic(g_cpn, ps, rf_rate, tenor_y, 100, 100, fq, nc_m, mode, b_r=b_rate, b_f=b_ref)[0]
-                if (v_min-100)*(v_max-100) < 0:
+                try:
                     sol = brentq(lambda x: run_pricing_logic(g_cpn, ps, rf_rate, tenor_y, x, 100, fq, nc_m, mode, b_r=b_rate, b_f=b_ref)[0]-100, 40, 100)
                     st.metric("Required Protection Barrier", f"{sol:.2f}%")
-                else: st.warning("⚠️ Market limits reached. Adjust coupon levels.")
+                except: st.warning("⚠️ Market limits reached. Adjust rates.")
         else:
+            # FCN restored layout
             stk_val = st.slider("Put Strike %", 40, 100, 75)
             ko_val = st.slider("KO Level %", 80, 130, 100)
             fq_val = st.selectbox("Frequency", ["Monthly", "Quarterly"])
@@ -129,14 +131,14 @@ if len(tks) >= 1:
                 sol = brentq(lambda x: run_pricing_logic(x, ps, rf_rate, tenor_y, stk_val, ko_val, fq, nc_m, mode, sd=sd)[0] - 100, 0, 1.0)
                 val, avg_cpn, prob_loss = run_pricing_logic(sol, ps, rf_rate, tenor_y, stk_val, ko_val, fq, nc_m, mode, sd=sd)
                 
-                # High-density output cards
+                # Metric Cards (Exactly as per image_e2515c)
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Solved Annual Yield", f"{sol*100:.2f}%")
                 m2.metric("Prob. of Capital Loss", f"{prob_loss*100:.1f}%")
                 m3.metric("Avg. Expected Coupons", f"{avg_cpn:.1f}")
                 
                 st.divider()
-                st.write("**Specific Asset Correlation**")
+                st.write("**Asset Correlation Matrix (Dynamic)**")
                 st.table(pd.DataFrame(corr, index=names, columns=names).style.format("{:.2f}"))
     else:
         st.error("❌ Invalid Tickers. Data fetch failed.")
