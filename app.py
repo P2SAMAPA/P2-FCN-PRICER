@@ -22,7 +22,6 @@ def get_market_data(tickers, tenor_mo, rf_choice, spread_bps, vol_mode, vol_wind
                 atm_option = chain.iloc[(chain['strike'] - spot).abs().argsort()[:1]]
                 ivs.append(atm_option['impliedVolatility'].values[0])
             else:
-                # Historical Standard Deviation
                 hist = tk.history(period=f"{vol_window}mo")['Close']
                 log_returns = np.log(hist / hist.shift(1))
                 ivs.append(log_returns.std() * np.sqrt(252))
@@ -53,19 +52,16 @@ class StructuredProductEngine:
         self.bonus_coupon = bonus_coupon / 100
         self.bonus_barrier = bonus_barrier / 100
 
-    def run_simulation(self, strike_pct, ko_pct, n_sims=2000):
+    def run_simulation(self, strike_pct, ko_pct, n_sims=1000):
         n_assets = len(self.tickers)
         dt = 1/252
         strike = strike_pct / 100
         ko_barrier = ko_pct / 100
-        
         corr_mat = np.full((n_assets, n_assets), 0.5)
         np.fill_diagonal(corr_mat, 1.0)
         L = np.linalg.cholesky(corr_mat)
         
-        total_payout_magnitude = 0
-        loss_frequency = 0
-        total_loss_amount = 0
+        total_payout_magnitude, loss_frequency, total_loss_amount = 0, 0, 0
         
         for _ in range(n_sims):
             Z = np.random.normal(0, 1, (self.steps, n_assets)) @ L.T
@@ -101,11 +97,10 @@ class StructuredProductEngine:
         prob_l = loss_frequency / n_sims
         expected_loss_ann = (total_loss_amount / n_sims) / self.tenor_yr
         ann_yield = (self.rf + expected_loss_ann) * 100
-        
         return (total_payout_magnitude / n_sims), prob_l, ann_yield
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="Quant Terminal", layout="wide")
+st.set_page_config(page_title="Pricer Terminal", layout="wide")
 st.title("🏦 Derivatives Pricing Terminal")
 
 tab1, tab2 = st.tabs(["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
@@ -142,16 +137,21 @@ with tab1:
             m1.metric("Annualized Yield", f"{a_y:.2f}%")
             m2.metric("Prob. Capital Loss", f"{p_l:.2%}")
             m3.metric("Avg Coupons", f"{avg_p:.4f}")
+            
             st.subheader("Sensitivity Analysis")
-            y_res = np.zeros((5,5)); l_res = np.zeros((5,5))
+            y_res, l_res = np.zeros((5,5)), np.zeros((5,5))
             prog = st.progress(0)
             for i, ko in enumerate(BARRIERS):
                 for j, sk in enumerate(STRIKES):
-                    _, cl, cy = eng.run_simulation(sk, ko, n_sims=400)
-                    y_res[i,j] = cy; l_res[i,j] = cl
+                    _, cl, cy = eng.run_simulation(sk, ko, n_sims=300)
+                    y_res[i,j], l_res[i,j] = cy, cl
                     prog.progress((i * 5 + j + 1) / 25)
-            st.write("**Yield Matrix (KO vs Strike)**")
-            st.dataframe(pd.DataFrame(y_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            
+            c1, c2 = st.columns(2)
+            c1.write("**Yield Matrix (KO vs Strike)**")
+            c1.dataframe(pd.DataFrame(y_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            c2.write("**Capital Loss Matrix (KO vs Strike)**")
+            c2.dataframe(pd.DataFrame(l_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
 
 # --- TAB 2: BCN ---
 with tab2:
@@ -163,14 +163,11 @@ with tab2:
         b_v_win = st.selectbox("Window (Mo)", [3, 6, 12, 24], index=2, key="b_vw") if "Historical" in b_v_mode else 12
         b_rf = st.selectbox("Rf Rate", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"], key="b_rf")
         b_sp = st.slider("Spread (bps)", 0, 500, 100, key="b_s") if "Spread" in b_rf else 0
-        b_gtd = st.number_input("Guaranteed (%)", 2.0, key="b_g")
-        b_bon = st.number_input("Bonus (%)", 8.0, key="b_b")
+        b_gtd, b_bon = st.number_input("Guaranteed (%)", 2.0, key="b_g"), st.number_input("Bonus (%)", 8.0, key="b_b")
         b_bar = st.slider("Bonus Barrier (%)", 50, 100, 85, key="b_ba")
         b_te = st.slider("Tenor (Months)", 1, 36, 12, key="b_te")
-        b_fr = st.selectbox("Frequency (Months)", [1, 3, 6, 12], key="b_fr")
-        b_nc = st.selectbox("No-Call (Months)", [1, 2, 3, 6], key="b_nc")
-        b_st = st.slider("Put Strike (%)", 50, 100, 75, key="b_st")
-        b_ko = st.slider("KO Barrier (%)", 80, 110, 100, key="b_ko")
+        b_fr, b_nc = st.selectbox("Frequency (Months)", [1, 3, 6, 12], key="b_fr"), st.selectbox("No-Call (Months)", [1, 2, 3, 6], key="b_nc")
+        b_st, b_ko = st.slider("Put Strike (%)", 50, 100, 75, key="b_st"), st.slider("KO Barrier (%)", 80, 110, 100, key="b_ko")
         b_ks = st.radio("KO Schedule", ["Fixed", "Step Down"], key="b_ks")
         b_sd = st.slider("Mo Step Down (%)", 0.0, 2.0, 0.5, key="b_sd") if b_ks == "Step Down" else 0
         run_bcn = st.button("Price BCN")
@@ -185,13 +182,18 @@ with tab2:
             m1.metric("Annualized Yield", f"{a_y:.2f}%")
             m2.metric("Prob. Capital Loss", f"{p_l:.2%}")
             m3.metric("Exp. Payout", f"{(avg_p*100):.2f}%")
+            
             st.subheader("Sensitivity Analysis")
-            y_res = np.zeros((5,5)); l_res = np.zeros((5,5))
+            y_res_b, l_res_b = np.zeros((5,5)), np.zeros((5,5))
             prog_b = st.progress(0)
             for i, ko in enumerate(BARRIERS):
                 for j, sk in enumerate(STRIKES):
-                    _, cl, cy = eng_b.run_simulation(sk, ko, n_sims=400)
-                    y_res[i,j] = cy; l_res[i,j] = cl
+                    _, cl, cy = eng_b.run_simulation(sk, ko, n_sims=300)
+                    y_res_b[i,j], l_res_b[i,j] = cy, cl
                     prog_b.progress((i * 5 + j + 1) / 25)
-            st.write("**Yield Matrix (KO vs Strike)**")
-            st.dataframe(pd.DataFrame(y_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            
+            c1b, c2b = st.columns(2)
+            c1b.write("**Yield Matrix (KO vs Strike)**")
+            c1b.dataframe(pd.DataFrame(y_res_b, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            c2b.write("**Capital Loss Matrix (KO vs Strike)**")
+            c2b.dataframe(pd.DataFrame(l_res_b, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
