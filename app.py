@@ -1,3 +1,10 @@
+I understand—it’s incredibly frustrating when the code blocks merge into a single line, causing that SyntaxError. This happens because of a rendering conflict between the chat interface and the script's format.
+
+To solve this once and for all, I have prepared the code in a indented, vertically spaced format below. This is the full code for your app.py.
+
+🛠️ Final GitHub Source: app.py
+Copy the text below and paste it into your GitHub file. Ensure that each import at the top is on its own separate line.
+
 import streamlit as st import numpy as np import pandas as pd import yfinance as yf from scipy.optimize import brentq
 
 st.set_page_config(page_title="Institutional Derivatives Lab", layout="wide")
@@ -12,4 +19,4 @@ def run_simulation(cpn, paths, r, t, stk, ko, f_m, nc_m, mode, sd): steps, n_s, 
 
 st.title(f"🚀 {mode} Terminal")
 
-if st.button("RUN MONTE CARLO PRICING"): v, corr, d, names = get_market_data(tks) n_s, n_d = 10000, int(tenor * 252) L = np.linalg.cholesky(corr + np.eye(len(v)) * 1e-10) dt = 1/252 drift = (r_val - d - 0.5 * v**2) * dt noise = np.einsum('ij,tkj->tki', L, np.random.standard_normal((n_d, n_s, len(v)))) rets = drift + (v * np.sqrt(dt)) * noise paths = np.vstack([np.ones((1, n_s, len(v)))100, 100 * np.exp(np.cumsum(rets, axis=0))]) try: target = lambda x: run_simulation(x, paths, r_val, tenor, stk_pct, ko_pct, freq_m, nc_m, mode, sd_val)[0] - 100 sol = brentq(target, 0, 2.0) _, loss = run_simulation(sol, paths, r_val, tenor, stk_pct, ko_pct, freq_m, nc_m, mode, sd_val) st.divider() c1, c2, c3 = st.columns(3) c1.metric("SOLVED ANNUAL YIELD", f"{sol100:.2f}%") c2.metric("PROB. CAPITAL LOSS", f"{loss100:.1f}%") c3.metric("EXP. COUPON EVENTS", f"{int(tenor * (12/freq_m))}") st.subheader("📊 Yield Sensitivity (KO Level vs Put Strike)") ko_range = [ko_pct-5, ko_pct, ko_pct+5] stk_range = [stk_pct-10, stk_pct-5, stk_pct, stk_pct+5, stk_pct+10] y_matrix = [] for k in ko_range: row = [] for s in stk_range: try: sy = brentq(lambda x: run_simulation(x, paths, r_val, tenor, s, k, freq_m, nc_m, mode, sd_val)[0]-100, 0, 2.0) row.append(f"{sy100:.1f}%") except: row.append("N/A") y_matrix.append(row) st.table(pd.DataFrame(y_matrix, index=[f"KO {k}%" for k in ko_range], columns=[f"Stk {s}%" for s in stk_range])) except Exception as e: st.error(f"Solver Error: {e}") st.divider() col1, col2 = st.columns(2) col1.write("Correlation") col1.dataframe(pd.DataFrame(corr, index=names, columns=names).style.format("{:.2f}")) col2.write("Parameters") col2.table(pd.DataFrame({"Asset": names, "Vol": v, "Div Yield": d}))
+if st.button("RUN MONTE CARLO PRICING"): v, corr, d, names = get_market_data(tks) n_s, n_d = 10000, int(tenor * 252) L = np.linalg.cholesky(corr + np.eye(len(v)) * 1e-10) dt = 1/252
