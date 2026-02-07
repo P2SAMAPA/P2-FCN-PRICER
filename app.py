@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import io
-from fpdf import FPDF
+from fpdf import FPDF  # Ensure 'fpdf2' or 'fpdf' is in requirements.txt
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="Pricer Terminal", layout="wide")
@@ -86,15 +86,16 @@ def create_pdf(prod_name, yield_df, loss_df):
     pdf.set_font("Arial", 'B', 16)
     pdf.cell(200, 10, f"{prod_name} Pricing Report", 0, 1, 'C')
     pdf.set_font("Arial", 'B', 12)
-    pdf.cell(200, 10, "Yield Matrix (Strike vs KO)", 0, 1, 'L')
-    pdf.set_font("Arial", '', 10)
-    pdf.multi_cell(0, 10, yield_df.to_string())
+    pdf.ln(10)
+    pdf.cell(200, 10, "Yield Matrix (KO vs Strike)", 0, 1, 'L')
+    pdf.set_font("Courier", '', 8)
+    pdf.multi_cell(0, 5, yield_df.to_string())
     pdf.ln(10)
     pdf.set_font("Arial", 'B', 12)
-    pdf.cell(200, 10, "Capital Loss Matrix", 0, 1, 'L')
-    pdf.set_font("Arial", '', 10)
-    pdf.multi_cell(0, 10, loss_df.to_string())
-    return pdf.output(dest='S').encode('latin-1')
+    pdf.cell(200, 10, "Capital Loss Matrix (KO vs Strike)", 0, 1, 'L')
+    pdf.set_font("Courier", '', 8)
+    pdf.multi_cell(0, 5, loss_df.to_string())
+    return pdf.output(dest='S') # Removed .encode for compatibility
 
 def create_excel(yield_df, loss_df):
     output = io.BytesIO()
@@ -146,6 +147,7 @@ with tab1:
             ca, cb = st.columns(2)
             ca.write("**Yield Matrix**"); ca.dataframe(df_y.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
             cb.write("**Loss Matrix**"); cb.dataframe(df_l.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+            
             if f_fmt == "Excel":
                 st.download_button("📥 Download Excel", create_excel(df_y, df_l), "FCN_Pricer.xlsx")
             else:
@@ -186,6 +188,7 @@ with tab2:
             cc, cd = st.columns(2)
             cc.write("**Yield Matrix**"); cc.dataframe(df_yb.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
             cd.write("**Loss Matrix**"); cd.dataframe(df_lb.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+            
             if b_fmt == "Excel":
                 st.download_button("📥 Download Excel", create_excel(df_yb, df_lb), "BCN_Pricer.xlsx")
             else:
