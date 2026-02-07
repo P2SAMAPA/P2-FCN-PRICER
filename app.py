@@ -2,6 +2,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import io
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="Pricer Terminal", layout="wide")
@@ -51,7 +52,6 @@ class PricingEngine:
         dt = 1/252
         strike, ko_barrier = strike_pct / 100, ko_pct / 100
         
-        # Applying Dynamic Correlation
         rho = self.correlation
         corr_matrix = np.full((n_assets, n_assets), rho)
         np.fill_diagonal(corr_matrix, 1.0)
@@ -102,10 +102,10 @@ class PricingEngine:
             
         return (total_payout_count / n_sims), (loss_freq / n_sims), avg_ann_yield
 
-# --- SIDEBAR GLOBAL OVERRIDE ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("Global Risk Parameters")
-    global_corr = st.slider("Asset Correlation", 0.0, 1.0, 0.6, 0.1, help="Higher correlation reduces Worst-Of risk for FCN yield.")
+    global_corr = st.slider("Asset Correlation", 0.0, 1.0, 0.6, 0.1)
 
 # --- UI TABS ---
 st.title("🏦 Derivatives Desk: FCN & BCN Pricer")
@@ -137,20 +137,32 @@ with tab1:
             c_cnt, l_pr, y_val = eng.run_simulation(f_st, f_ko)
             st.divider()
             m1, m2, m3 = st.columns(3)
-            m1.metric("Output Yield (Max Coupon)", f"{y_val:.2f}%")
+            m1.metric("Output Yield", f"{y_val:.2f}%")
             m2.metric("Prob. Capital Loss", f"{l_pr:.2%}")
-            m3.metric("Expected Life", f"{c_cnt:.2f} Periods")
+            m3.metric("Exp. Life (Periods)", f"{c_cnt:.2f}")
             
             y_m, l_m = np.zeros((5,5)), np.zeros((5,5))
             p = st.progress(0)
             for i, ko in enumerate(BARRIERS):
                 for j, sk in enumerate(STRIKES):
-                    c, l, y = eng.run_simulation(sk, ko, n_sims=300)
+                    _, l, y = eng.run_simulation(sk, ko, n_sims=300)
                     y_m[i,j], l_m[i,j] = y, l
                     p.progress((i*5+j+1)/25)
+            
+            df_y = pd.DataFrame(y_m, index=BARRIERS, columns=STRIKES)
+            df_l = pd.DataFrame(l_m, index=BARRIERS, columns=STRIKES)
+            
             ca, cb = st.columns(2)
-            ca.write("**Yield Matrix**"); ca.dataframe(pd.DataFrame(y_m, BARRIERS, STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
-            cb.write("**Loss Matrix**"); cb.dataframe(pd.DataFrame(l_m, BARRIERS, STRIKES).style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+            ca.write("**Yield Matrix**"); ca.dataframe(df_y.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            cb.write("**Loss Matrix**"); cb.dataframe(df_l.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+            
+            # Export Logic
+            csv_buf = io.StringIO()
+            csv_buf.write("YIELD MATRIX\n")
+            df_y.to_csv(csv_buf)
+            csv_buf.write("\nCAPITAL LOSS MATRIX\n")
+            df_l.to_csv(csv_buf)
+            st.download_button("📥 Download Matrices", csv_buf.getvalue(), "FCN_Report.csv", "text/csv")
 
 # --- BCN MODULE ---
 with tab2:
@@ -168,29 +180,4 @@ with tab2:
         b_fr = st.selectbox("Frequency (Mo)", [1, 3, 6], key="bfr")
         b_nc = st.selectbox("No-Call (Mo)", [1, 3, 6], key="bnc")
         b_st = st.slider("Put Strike (%)", 50, 100, 75, key="bst")
-        b_ko = st.slider("KO Barrier (%)", 80, 150, 100, key="bko")
-        b_ks = st.radio("KO Schedule", ["Fixed", "Step Down"], key="bks")
-        b_sd = st.slider("Mo Step Down (%)", 0.0, 2.0, 0.5, key="bsd") if b_ks == "Step Down" else 0
-        run_bcn = st.button("Calculate BCN")
-
-    if run_bcn:
-        with bc2:
-            v_list_b, rf_b = get_market_data(b_t, b_te, b_rf, b_v, b_vw)
-            eng_b = PricingEngine(v_list_b, rf_b, b_te, b_fr, b_nc, b_ks, b_sd, "BCN", correlation=global_corr, gtd_rate=b_gtd, bonus_rate=b_bon, bonus_barr=b_bar)
-            c_cnt_b, l_pr_b, y_val_b = eng_b.run_simulation(b_st, b_ko)
-            st.divider()
-            m1b, m2b, m3b = st.columns(3)
-            m1b.metric("Portfolio Yield", f"{y_val_b:.2f}%")
-            m2b.metric("Prob. Capital Loss", f"{l_pr_b:.2%}")
-            m3b.metric("Bonus Payouts", f"{c_cnt_b:.2f} Periods")
-            
-            y_m_b, l_m_b = np.zeros((5,5)), np.zeros((5,5))
-            p_b = st.progress(0)
-            for i, ko in enumerate(BARRIERS):
-                for j, sk in enumerate(STRIKES):
-                    cb, lb, yb = eng_b.run_simulation(sk, ko, n_sims=300)
-                    y_m_b[i,j], l_m_b[i,j] = yb, lb
-                    p_b.progress((i*5+j+1)/25)
-            cc, cd = st.columns(2)
-            cc.write("**Yield Matrix**"); cc.dataframe(pd.DataFrame(y_m_b, BARRIERS, STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
-            cd.write("**Loss Matrix**"); cd.dataframe(pd.DataFrame(l_m_b, BARRIERS, STRIKES).style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+        b_ko = st
