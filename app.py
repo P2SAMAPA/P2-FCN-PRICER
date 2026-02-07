@@ -67,7 +67,7 @@ class StructuredProductEngine:
             worst_path = np.min(paths, axis=1)
             
             knocked_out = False
-            sim_coupons = 0
+            sim_payout = 0
             
             for step in self.obs_steps:
                 curr_ko = ko_barrier
@@ -76,19 +76,18 @@ class StructuredProductEngine:
 
                 if step >= self.nocall_steps and worst_path[step-1] >= curr_ko:
                     knocked_out = True
-                    # Pay current period coupons and exit
-                    sim_coupons += self.gtd_coupon / (12/max(1, (self.obs_steps[0]/21 if self.obs_steps[0]>0 else 1)))
+                    # Pay accrued coupons for final period
+                    sim_payout += self.gtd_coupon / len(self.obs_steps)
                     if self.prod_type == "BCN" and worst_path[step-1] >= self.bonus_barrier:
-                        sim_coupons += self.bonus_coupon / (12/max(1, (self.obs_steps[0]/21 if self.obs_steps[0]>0 else 1)))
+                        sim_payout += self.bonus_coupon / len(self.obs_steps)
                     break
                 
-                # Accrue Period Coupons
-                period_gtd = self.gtd_coupon / (len(self.obs_steps))
-                sim_coupons += period_gtd
+                # Period Coupon
+                sim_payout += self.gtd_coupon / len(self.obs_steps)
                 if self.prod_type == "BCN" and worst_path[step-1] >= self.bonus_barrier:
-                    sim_coupons += self.bonus_coupon / (len(self.obs_steps))
+                    sim_payout += self.bonus_coupon / len(self.obs_steps)
             
-            total_payout_magnitude += sim_coupons
+            total_payout_magnitude += sim_payout
             if not knocked_out and worst_path[-1] < strike:
                 loss_frequency += 1
                 total_loss_amount += (strike - worst_path[-1])
@@ -100,10 +99,14 @@ class StructuredProductEngine:
         return (total_payout_magnitude / n_sims), prob_l, ann_yield
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="Quant Desk: FCN & BCN", layout="wide")
+st.set_page_config(page_title="Pricer Terminal", layout="wide")
 st.title("🏦 Derivatives Pricing Terminal")
 
 tab1, tab2 = st.tabs(["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
+
+# Shared constants for matrices
+STRIKES = [70, 75, 80, 85, 90]
+BARRIERS = [90, 95, 100, 105, 110]
 
 # --- TAB 1: FCN ---
 with tab1:
@@ -120,7 +123,6 @@ with tab1:
         f_ko = st.slider("KO Barrier (%)", 80, 110, 100, key="f_ko")
         f_ko_style = st.radio("KO Schedule", ["Fixed", "Step Down"], key="f_ks")
         f_step = st.slider("Monthly Step Down (%)", 0.0, 2.0, 0.5, key="f_sd") if f_ko_style == "Step Down" else 0
-        
         run_fcn = st.button("Price FCN")
 
     with col2:
@@ -130,8 +132,39 @@ with tab1:
             eng = StructuredProductEngine(t_list, vols, rf, f_tenor, f_freq, f_nocall, f_ko_style, f_step, "FCN")
             avg_p, p_l, a_y = eng.run_simulation(f_strike, f_ko)
             
-            # Metrics
             st.divider()
             m1, m2, m3 = st.columns(3)
             m1.metric("Est. Annualized Yield", f"{a_y:.2f}%")
-            m2.metric("Prob. of Capital Loss", f"{p_l:.
+            m2.metric("Prob. of Capital Loss", f"{p_l:.2%}")
+            m3.metric("Likely Avg Coupon Paid", f"{avg_p:.4f}")
+
+            st.subheader("Sensitivity Analysis")
+            y_res = np.zeros((5,5)); l_res = np.zeros((5,5))
+            prog = st.progress(0)
+            for i, ko in enumerate(BARRIERS):
+                for j, sk in enumerate(STRIKES):
+                    _, cl, cy = eng.run_simulation(sk, ko, n_sims=400)
+                    y_res[i,j] = cy; l_res[i,j] = cl
+                    prog.progress((i * 5 + j + 1) / 25)
+            
+            st.write("**Yield Matrix (Rows: KO, Cols: Strike)**")
+            st.dataframe(pd.DataFrame(y_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            st.write("**Capital Loss Matrix**")
+            st.dataframe(pd.DataFrame(l_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+
+# --- TAB 2: BCN ---
+with tab2:
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.header("BCN Inputs")
+        b_tickers = st.text_input("Underlyings", "TSLA, NVDA, AMD", key="b_t")
+        b_rf_choice = st.selectbox("Rf Rate", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"], key="b_rf")
+        b_spread = st.slider("Spread (bps)", 0, 500, 100, key="b_s") if "Spread" in b_rf_choice else 0
+        b_gtd = st.number_input("Guaranteed Coupon (Annual %)", 2.0, key="b_g")
+        b_bonus = st.number_input("Bonus Coupon (Annual %)", 8.0, key="b_b")
+        b_barr = st.slider("Bonus Coupon Barrier (%)", 50, 100, 85, key="b_ba")
+        b_tenor = st.slider("Tenor (Months)", 1, 36, 12, key="b_te")
+        b_freq = st.selectbox("Coupon Frequency (Months)", [1, 3, 6, 12], key="b_fr")
+        b_nocall = st.selectbox("No-Call Period (Months)", [1, 2, 3, 6], key="b_nc")
+        b_strike = st.slider("Put Strike (%)", 50, 100, 75, key="b_st")
+        b_ko = st.slider("KO Barrier (%)", 80, 110, 100, key
