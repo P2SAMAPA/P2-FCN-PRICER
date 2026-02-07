@@ -19,7 +19,7 @@ def get_market_data(tickers, tenor_mo, rf_choice, spread_bps):
             atm_option = chain.iloc[(chain['strike'] - spot).abs().argsort()[:1]]
             ivs.append(atm_option['impliedVolatility'].values[0])
         except:
-            ivs.append(0.35) # Conservative default for high-beta stocks
+            ivs.append(0.35) 
     
     rf_benchmarks = {
         "3M T-Bill": 0.0535, "1Y UST": 0.0485, "SOFR": 0.0531,
@@ -29,33 +29,35 @@ def get_market_data(tickers, tenor_mo, rf_choice, spread_bps):
 
 # --- QUANT ENGINE ---
 class StructuredProductEngine:
-    def __init__(self, tickers, vols, rf, tenor_mo, freq_mo, nocall_mo, ko_style, step_down, prod_type):
+    def __init__(self, tickers, vols, rf, tenor_mo, freq_mo, nocall_mo, ko_style, step_down, prod_type, gtd_coupon=0, bonus_coupon=0, bonus_barrier=0):
         self.tickers = tickers
         self.vols = np.array(vols)
         self.rf = rf
         self.tenor_yr = tenor_mo / 12
         self.steps = int(self.tenor_yr * 252)
-        self.freq_steps = int((freq_mo/12)*252)
-        self.obs_steps = np.arange(self.freq_steps, self.steps + 1, self.freq_steps)
+        safe_freq = max(1, freq_mo)
+        self.obs_steps = np.arange(int((safe_freq/12)*252), self.steps + 1, int((safe_freq/12)*252))
         self.nocall_steps = int((nocall_mo/12)*252)
         self.ko_style = ko_style
         self.step_down_daily = (step_down / 100) / 21
         self.prod_type = prod_type
+        self.gtd_coupon = gtd_coupon / 100
+        self.bonus_coupon = bonus_coupon / 100
+        self.bonus_barrier = bonus_barrier / 100
 
-    def run_simulation(self, strike_pct, ko_pct, n_sims=3000):
+    def run_simulation(self, strike_pct, ko_pct, n_sims=2000):
         n_assets = len(self.tickers)
         dt = 1/252
         strike = strike_pct / 100
         ko_barrier = ko_pct / 100
         
-        # 0.5 Correlation for "Worst-Of" Basket Effect
         corr_mat = np.full((n_assets, n_assets), 0.5)
         np.fill_diagonal(corr_mat, 1.0)
         L = np.linalg.cholesky(corr_mat)
         
-        total_coupons = 0
+        total_payout_magnitude = 0
         loss_frequency = 0
-        total_loss_magnitude = 0
+        total_loss_amount = 0
         
         for _ in range(n_sims):
             Z = np.random.normal(0, 1, (self.steps, n_assets)) @ L.T
@@ -64,8 +66,8 @@ class StructuredProductEngine:
             paths = np.exp(np.cumsum(drift + diffusion, axis=0))
             worst_path = np.min(paths, axis=1)
             
-            sim_coupons = 0
             knocked_out = False
+            sim_coupons = 0
             
             for step in self.obs_steps:
                 curr_ko = ko_barrier
@@ -73,95 +75,63 @@ class StructuredProductEngine:
                     curr_ko -= (self.step_down_daily * (step - self.nocall_steps))
 
                 if step >= self.nocall_steps and worst_path[step-1] >= curr_ko:
-                    sim_coupons += 1
                     knocked_out = True
+                    # Pay current period coupons and exit
+                    sim_coupons += self.gtd_coupon / (12/max(1, (self.obs_steps[0]/21 if self.obs_steps[0]>0 else 1)))
+                    if self.prod_type == "BCN" and worst_path[step-1] >= self.bonus_barrier:
+                        sim_coupons += self.bonus_coupon / (12/max(1, (self.obs_steps[0]/21 if self.obs_steps[0]>0 else 1)))
                     break
                 
-                if self.prod_type == "Fixed Coupon Note (FCN)":
-                    sim_coupons += 1
-                elif worst_path[step-1] >= strike:
-                    sim_coupons += 1
+                # Accrue Period Coupons
+                period_gtd = self.gtd_coupon / (len(self.obs_steps))
+                sim_coupons += period_gtd
+                if self.prod_type == "BCN" and worst_path[step-1] >= self.bonus_barrier:
+                    sim_coupons += self.bonus_coupon / (len(self.obs_steps))
             
-            total_coupons += sim_coupons
-            # Capital loss logic: Only if no KO and final price < strike
+            total_payout_magnitude += sim_coupons
             if not knocked_out and worst_path[-1] < strike:
                 loss_frequency += 1
-                total_loss_magnitude += (strike - worst_path[-1])
+                total_loss_amount += (strike - worst_path[-1])
                 
-        avg_c = total_coupons / n_sims
         prob_l = loss_frequency / n_sims
+        expected_loss_ann = (total_loss_amount / n_sims) / self.tenor_yr
+        ann_yield = (self.rf + expected_loss_ann) * 100
         
-        # RECTIFIED MATH: Yield = Risk-Free + (Expected Loss Magnitude / Tenor)
-        # This treats the yield as the premium for the sold put.
-        expected_loss_pct = total_loss_magnitude / n_sims
-        ann_yield = (self.rf + (expected_loss_pct / self.tenor_yr)) * 100
-        
-        return avg_c, prob_l, ann_yield
+        return (total_payout_magnitude / n_sims), prob_l, ann_yield
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="Institutional FCN/BCN Pricer", layout="wide")
-st.title("🛡️ Structured Product Desk: FCN & BCN")
+st.set_page_config(page_title="Quant Desk: FCN & BCN", layout="wide")
+st.title("🏦 Derivatives Pricing Terminal")
 
-with st.sidebar:
-    st.header("Input Parameters")
-    prod_choice = st.selectbox("Product Type", ["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
-    tickers_in = st.text_input("Underlyings", "AAPL, MSFT, NVDA")
-    vol_mode = st.radio("Volatility Source", ["Real-time Implied (yFinance)", "Historical (Default)"])
-    rf_choice = st.selectbox("Rf Rate Selection", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"])
-    spread_bps = st.slider("Spread (bps)", 0, 500, 100) if "Spread" in rf_choice else 0
-    
-    st.divider()
-    tenor = st.slider("Tenor (Months)", 1, 36, 12)
-    c_freq = st.selectbox("Coupon Frequency (Months)", [1, 3, 6, 12])
-    nocall = st.selectbox("No-Call Period (Months)", [1, 2, 3, 4, 6])
-    
-    st.divider()
-    p_strike = st.slider("Put Strike (%)", 50, 100, 80)
-    ko_init = st.slider("KO Barrier (%)", 80, 110, 100)
-    ko_style = st.radio("KO Schedule", ["Fixed", "Step Down"])
-    step_val = st.slider("Monthly Step Down (%)", 0.0, 2.0, 0.5) if ko_style == "Step Down" else 0
+tab1, tab2 = st.tabs(["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
 
-if st.button("Run Global Pricer"):
-    ticker_list = [t.strip().upper() for t in tickers_in.split(",")]
-    vols, rf_rate = get_market_data(ticker_list, tenor, rf_choice, spread_bps)
-    engine = StructuredProductEngine(ticker_list, vols, rf_rate, tenor, c_freq, nocall, ko_style, step_val, prod_choice)
-    
-    # 1. Base Case
-    avg_c, p_loss, a_yield = engine.run_simulation(p_strike, ko_init)
-    
-    st.divider()
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Est. Annualized Yield", f"{a_yield:.2f}%")
-    m2.metric("Prob. of Capital Loss", f"{p_loss:.2%}")
-    m3.metric("Likely Coupons Paid", f"{avg_c:.2f}")
+# --- TAB 1: FCN ---
+with tab1:
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.header("FCN Inputs")
+        f_tickers = st.text_input("Underlyings", "AAPL, MSFT, GOOG", key="f_t")
+        f_rf_choice = st.selectbox("Rf Rate", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"], key="f_rf")
+        f_spread = st.slider("Spread (bps)", 0, 500, 100, key="f_s") if "Spread" in f_rf_choice else 0
+        f_tenor = st.slider("Tenor (Months)", 1, 36, 12, key="f_te")
+        f_freq = st.selectbox("Coupon Frequency (Months)", [1, 3, 6, 12], key="f_fr")
+        f_nocall = st.selectbox("No-Call Period (Months)", [1, 2, 3, 6], key="f_nc")
+        f_strike = st.slider("Put Strike (%)", 50, 100, 80, key="f_st")
+        f_ko = st.slider("KO Barrier (%)", 80, 110, 100, key="f_ko")
+        f_ko_style = st.radio("KO Schedule", ["Fixed", "Step Down"], key="f_ks")
+        f_step = st.slider("Monthly Step Down (%)", 0.0, 2.0, 0.5, key="f_sd") if f_ko_style == "Step Down" else 0
+        
+        run_fcn = st.button("Price FCN")
 
-    # 2. Sensitivity Analysis
-    st.subheader("Sensitivity Analysis")
-    st.caption("Rows: KO Barrier (%) | Columns: Put Strike (%)")
-    
-    strikes = [70, 75, 80, 85, 90]
-    barriers = [90, 95, 100, 105, 110]
-    
-    yield_results = np.zeros((len(barriers), len(strikes)))
-    loss_results = np.zeros((len(barriers), len(strikes)))
-
-    # Progress bar for Matrix
-    prog = st.progress(0)
-    for i, ko in enumerate(barriers):
-        for j, strike in enumerate(strikes):
-            # Reduced sims for matrix speed
-            _, cell_loss, cell_yield = engine.run_simulation(strike, ko, n_sims=800)
-            yield_results[i, j] = cell_yield
-            loss_results[i, j] = cell_loss
-            prog.progress((i * len(strikes) + j + 1) / (len(barriers)*len(strikes)))
-
-    df_y = pd.DataFrame(yield_results, index=barriers, columns=strikes)
-    df_l = pd.DataFrame(loss_results, index=barriers, columns=strikes)
-
-    c_left, c_right = st.columns(2)
-    with c_left:
-        st.write("**Yield Matrix (Annualized)**")
-        st.dataframe(df_y.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
-    with c_right:
-        st.write("**Capital Loss Matrix (Probability)**")
-        st.dataframe(df_l.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+    with col2:
+        if run_fcn:
+            t_list = [t.strip().upper() for t in f_tickers.split(",")]
+            vols, rf = get_market_data(t_list, f_tenor, f_rf_choice, f_spread)
+            eng = StructuredProductEngine(t_list, vols, rf, f_tenor, f_freq, f_nocall, f_ko_style, f_step, "FCN")
+            avg_p, p_l, a_y = eng.run_simulation(f_strike, f_ko)
+            
+            # Metrics
+            st.divider()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Est. Annualized Yield", f"{a_y:.2f}%")
+            m2.metric("Prob. of Capital Loss", f"{p_l:.
