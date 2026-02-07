@@ -67,7 +67,7 @@ class StructuredProductEngine:
             worst_path = np.min(paths, axis=1)
             
             knocked_out = False
-            sim_payout = 0
+            sim_coupons = 0
             
             for step in self.obs_steps:
                 curr_ko = ko_barrier
@@ -76,18 +76,16 @@ class StructuredProductEngine:
 
                 if step >= self.nocall_steps and worst_path[step-1] >= curr_ko:
                     knocked_out = True
-                    # Pay accrued coupons for final period
-                    sim_payout += self.gtd_coupon / len(self.obs_steps)
+                    sim_coupons += (self.gtd_coupon / len(self.obs_steps))
                     if self.prod_type == "BCN" and worst_path[step-1] >= self.bonus_barrier:
-                        sim_payout += self.bonus_coupon / len(self.obs_steps)
+                        sim_coupons += (self.bonus_coupon / len(self.obs_steps))
                     break
                 
-                # Period Coupon
-                sim_payout += self.gtd_coupon / len(self.obs_steps)
+                sim_coupons += (self.gtd_coupon / len(self.obs_steps))
                 if self.prod_type == "BCN" and worst_path[step-1] >= self.bonus_barrier:
-                    sim_payout += self.bonus_coupon / len(self.obs_steps)
+                    sim_coupons += (self.bonus_coupon / len(self.obs_steps))
             
-            total_payout_magnitude += sim_payout
+            total_payout_magnitude += sim_coupons
             if not knocked_out and worst_path[-1] < strike:
                 loss_frequency += 1
                 total_loss_amount += (strike - worst_path[-1])
@@ -104,7 +102,6 @@ st.title("🏦 Derivatives Pricing Terminal")
 
 tab1, tab2 = st.tabs(["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
 
-# Shared constants for matrices
 STRIKES = [70, 75, 80, 85, 90]
 BARRIERS = [90, 95, 100, 105, 110]
 
@@ -167,4 +164,34 @@ with tab2:
         b_freq = st.selectbox("Coupon Frequency (Months)", [1, 3, 6, 12], key="b_fr")
         b_nocall = st.selectbox("No-Call Period (Months)", [1, 2, 3, 6], key="b_nc")
         b_strike = st.slider("Put Strike (%)", 50, 100, 75, key="b_st")
-        b_ko = st.slider("KO Barrier (%)", 80, 110, 100, key
+        b_ko = st.slider("KO Barrier (%)", 80, 110, 100, key="b_ko")
+        b_ko_style = st.radio("KO Schedule", ["Fixed", "Step Down"], key="b_ks")
+        b_step = st.slider("Monthly Step Down (%)", 0.0, 2.0, 0.5, key="b_sd") if b_ko_style == "Step Down" else 0
+        run_bcn = st.button("Price BCN")
+
+    with col2:
+        if run_bcn:
+            t_list = [t.strip().upper() for t in b_tickers.split(",")]
+            vols, rf = get_market_data(t_list, b_tenor, b_rf_choice, b_spread)
+            eng_b = StructuredProductEngine(t_list, vols, rf, b_tenor, b_freq, b_nocall, b_ko_style, b_step, "BCN", b_gtd, b_bonus, b_barr)
+            avg_p, p_l, a_y = eng_b.run_simulation(b_strike, b_ko)
+            
+            st.divider()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Est. Annualized Yield", f"{a_y:.2f}%")
+            m2.metric("Prob. of Capital Loss", f"{p_l:.2%}")
+            m3.metric("Expected Total Payout", f"{(avg_p*100):.2f}%")
+
+            st.subheader("Sensitivity Analysis")
+            y_res = np.zeros((5,5)); l_res = np.zeros((5,5))
+            prog_b = st.progress(0)
+            for i, ko in enumerate(BARRIERS):
+                for j, sk in enumerate(STRIKES):
+                    _, cl, cy = eng_b.run_simulation(sk, ko, n_sims=400)
+                    y_res[i,j] = cy; l_res[i,j] = cl
+                    prog_b.progress((i * 5 + j + 1) / 25)
+            
+            st.write("**Yield Matrix (Annualized)**")
+            st.dataframe(pd.DataFrame(y_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            st.write("**Capital Loss Matrix**")
+            st.dataframe(pd.DataFrame(l_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
