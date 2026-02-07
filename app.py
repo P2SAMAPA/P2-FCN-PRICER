@@ -19,7 +19,7 @@ def get_market_data(tickers, tenor_mo, rf_choice, spread_bps):
             atm_option = chain.iloc[(chain['strike'] - spot).abs().argsort()[:1]]
             ivs.append(atm_option['impliedVolatility'].values[0])
         except:
-            ivs.append(0.30)
+            ivs.append(0.35) # Conservative default for high-beta stocks
     
     rf_benchmarks = {
         "3M T-Bill": 0.0535, "1Y UST": 0.0485, "SOFR": 0.0531,
@@ -42,19 +42,20 @@ class StructuredProductEngine:
         self.step_down_daily = (step_down / 100) / 21
         self.prod_type = prod_type
 
-    def run_simulation(self, strike_pct, ko_pct, n_sims=2000):
+    def run_simulation(self, strike_pct, ko_pct, n_sims=3000):
         n_assets = len(self.tickers)
         dt = 1/252
         strike = strike_pct / 100
         ko_barrier = ko_pct / 100
         
-        # Correlated Paths (0.5 Correlation)
+        # 0.5 Correlation for "Worst-Of" Basket Effect
         corr_mat = np.full((n_assets, n_assets), 0.5)
         np.fill_diagonal(corr_mat, 1.0)
         L = np.linalg.cholesky(corr_mat)
         
         total_coupons = 0
-        losses = 0
+        loss_frequency = 0
+        total_loss_magnitude = 0
         
         for _ in range(n_sims):
             Z = np.random.normal(0, 1, (self.steps, n_assets)) @ L.T
@@ -65,6 +66,7 @@ class StructuredProductEngine:
             
             sim_coupons = 0
             knocked_out = False
+            
             for step in self.obs_steps:
                 curr_ko = ko_barrier
                 if self.ko_style == "Step Down" and step > self.nocall_steps:
@@ -75,43 +77,51 @@ class StructuredProductEngine:
                     knocked_out = True
                     break
                 
-                # FCN pays fixed; BCN only pays if above strike
                 if self.prod_type == "Fixed Coupon Note (FCN)":
                     sim_coupons += 1
                 elif worst_path[step-1] >= strike:
                     sim_coupons += 1
             
             total_coupons += sim_coupons
+            # Capital loss logic: Only if no KO and final price < strike
             if not knocked_out and worst_path[-1] < strike:
-                losses += 1
+                loss_frequency += 1
+                total_loss_magnitude += (strike - worst_path[-1])
                 
         avg_c = total_coupons / n_sims
-        prob_l = losses / n_sims
-        # Yield is scaled by the risk profile (Strike/KO interaction)
-        # Note: In real markets, yield is an input, price is output. 
-        # Here we simulate theoretical yield based on probability of being in-the-money.
-        ann_yield = (avg_c / (self.tenor_yr * (12/max(1, (self.obs_steps[0] if len(self.obs_steps)>0 else 1))))) * (self.rf * 100) * (1 + (strike - 0.7))
+        prob_l = loss_frequency / n_sims
+        
+        # RECTIFIED MATH: Yield = Risk-Free + (Expected Loss Magnitude / Tenor)
+        # This treats the yield as the premium for the sold put.
+        expected_loss_pct = total_loss_magnitude / n_sims
+        ann_yield = (self.rf + (expected_loss_pct / self.tenor_yr)) * 100
         
         return avg_c, prob_l, ann_yield
 
-# --- UI ---
-st.set_page_config(page_title="Pricer Pro", layout="wide")
-st.title("🛡️ Institutional FCN & BCN Desk")
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="Institutional FCN/BCN Pricer", layout="wide")
+st.title("🛡️ Structured Product Desk: FCN & BCN")
 
 with st.sidebar:
-    prod_choice = st.selectbox("Product", ["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
+    st.header("Input Parameters")
+    prod_choice = st.selectbox("Product Type", ["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
     tickers_in = st.text_input("Underlyings", "AAPL, MSFT, NVDA")
-    rf_choice = st.selectbox("Rf Rate", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"])
+    vol_mode = st.radio("Volatility Source", ["Real-time Implied (yFinance)", "Historical (Default)"])
+    rf_choice = st.selectbox("Rf Rate Selection", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"])
     spread_bps = st.slider("Spread (bps)", 0, 500, 100) if "Spread" in rf_choice else 0
+    
+    st.divider()
     tenor = st.slider("Tenor (Months)", 1, 36, 12)
     c_freq = st.selectbox("Coupon Frequency (Months)", [1, 3, 6, 12])
     nocall = st.selectbox("No-Call Period (Months)", [1, 2, 3, 4, 6])
+    
+    st.divider()
     p_strike = st.slider("Put Strike (%)", 50, 100, 80)
     ko_init = st.slider("KO Barrier (%)", 80, 110, 100)
-    ko_style = st.radio("KO Style", ["Fixed", "Step Down"])
+    ko_style = st.radio("KO Schedule", ["Fixed", "Step Down"])
     step_val = st.slider("Monthly Step Down (%)", 0.0, 2.0, 0.5) if ko_style == "Step Down" else 0
 
-if st.button("Run Full Matrix Pricer"):
+if st.button("Run Global Pricer"):
     ticker_list = [t.strip().upper() for t in tickers_in.split(",")]
     vols, rf_rate = get_market_data(ticker_list, tenor, rf_choice, spread_bps)
     engine = StructuredProductEngine(ticker_list, vols, rf_rate, tenor, c_freq, nocall, ko_style, step_val, prod_choice)
@@ -125,7 +135,7 @@ if st.button("Run Full Matrix Pricer"):
     m2.metric("Prob. of Capital Loss", f"{p_loss:.2%}")
     m3.metric("Likely Coupons Paid", f"{avg_c:.2f}")
 
-    # 2. Sensitivity Matrices (Horizontal = Put Strike, Vertical = KO)
+    # 2. Sensitivity Analysis
     st.subheader("Sensitivity Analysis")
     st.caption("Rows: KO Barrier (%) | Columns: Put Strike (%)")
     
@@ -135,25 +145,23 @@ if st.button("Run Full Matrix Pricer"):
     yield_results = np.zeros((len(barriers), len(strikes)))
     loss_results = np.zeros((len(barriers), len(strikes)))
 
-    # Progress bar for the matrix simulation
-    progress = st.progress(0)
-    total_cells = len(barriers) * len(strikes)
-    
+    # Progress bar for Matrix
+    prog = st.progress(0)
     for i, ko in enumerate(barriers):
         for j, strike in enumerate(strikes):
-            # Run a smaller simulation for each cell for speed
-            _, cell_loss, cell_yield = engine.run_simulation(strike, ko, n_sims=1000)
+            # Reduced sims for matrix speed
+            _, cell_loss, cell_yield = engine.run_simulation(strike, ko, n_sims=800)
             yield_results[i, j] = cell_yield
             loss_results[i, j] = cell_loss
-            progress.progress((i * len(strikes) + j + 1) / total_cells)
+            prog.progress((i * len(strikes) + j + 1) / (len(barriers)*len(strikes)))
 
     df_y = pd.DataFrame(yield_results, index=barriers, columns=strikes)
     df_l = pd.DataFrame(loss_results, index=barriers, columns=strikes)
 
     c_left, c_right = st.columns(2)
     with c_left:
-        st.write("**Yield Matrix**")
+        st.write("**Yield Matrix (Annualized)**")
         st.dataframe(df_y.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
     with c_right:
-        st.write("**Capital Loss Matrix**")
+        st.write("**Capital Loss Matrix (Probability)**")
         st.dataframe(df_l.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
