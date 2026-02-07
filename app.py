@@ -4,69 +4,72 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
 
-# --- MARKET DATA HELPERS ---
-def get_rf_rate(choice, spread=0):
-    # In a production app, these would be scraped from Treasury.gov or FRED
-    rates = {
-        "3M T-Bill": 0.053,
-        "1Y UST": 0.048,
-        "SOFR": 0.0531,
-        "3M T-Bill + Spread": 0.053 + (spread / 10000) # spread in bps
-    }
-    return rates.get(choice, 0.05)
-
-def get_market_iv(tickers, tenor_mo):
+# --- MARKET DATA LAYER ---
+@st.cache_data(ttl=3600)
+def get_market_data(tickers, tenor_mo, rf_choice, spread_bps):
+    # 1. Fetch Implied Volatilities
     ivs = []
+    target_date = datetime.now() + timedelta(days=tenor_mo * 30)
+    
     for ticker in tickers:
         try:
             tk = yf.Ticker(ticker.strip().upper())
             expirations = tk.options
-            # Find closest expiration to tenor
-            target = datetime.now() + timedelta(days=tenor_mo * 30)
-            closest_exp = min(expirations, key=lambda x: abs((datetime.strptime(x, '%Y-%m-%d') - target).days))
+            closest_exp = min(expirations, key=lambda x: abs((datetime.strptime(x, '%Y-%m-%d') - target_date).days))
             chain = tk.option_chain(closest_exp).calls
             spot = tk.history(period="1d")['Close'].iloc[-1]
             atm_option = chain.iloc[(chain['strike'] - spot).abs().argsort()[:1]]
             ivs.append(atm_option['impliedVolatility'].values[0])
         except:
-            ivs.append(0.30) # Default 30% Vol
-    return ivs
+            ivs.append(0.30) # Default fallback
 
-# --- PRICING ENGINE ---
+    # 2. Handle Risk-Free Rate Logic
+    rf_benchmarks = {
+        "3M T-Bill": 0.0535,
+        "1Y UST": 0.0485,
+        "SOFR": 0.0531,
+        "3M T-Bill + Spread": 0.0535 + (spread_bps / 10000)
+    }
+    rf_rate = rf_benchmarks.get(rf_choice, 0.05)
+    
+    return ivs, rf_rate
+
+# --- QUANT ENGINE ---
 class StructuredProductEngine:
     def __init__(self, tickers, vols, rf, tenor_mo, freq_mo, nocall_mo, strike_pct, ko_pct, ko_type, step_down, prod_type):
         self.tickers = tickers
-        self.vols = vols
+        self.vols = np.array(vols)
         self.rf = rf
         self.tenor_yr = tenor_mo / 12
         self.steps = int(self.tenor_yr * 252)
-        self.obs_steps = np.arange(int((freq_mo/12)*252), self.steps + 1, int((freq_mo/12)*252))
+        # Fix: ensure freq_mo is at least 1 to avoid division by zero
+        safe_freq = max(1, freq_mo)
+        self.obs_steps = np.arange(int((safe_freq/12)*252), self.steps + 1, int((safe_freq/12)*252))
         self.nocall_steps = int((nocall_mo/12)*252)
         self.strike = strike_pct / 100
         self.ko = ko_pct / 100
         self.ko_type = ko_type
-        self.step_down_daily = (step_down / 100) / 21 # Monthly % to Daily
+        self.step_down_daily = (step_down / 100) / 21
         self.prod_type = prod_type
-        self.coupon_rate = rf # Assume coupon scales with Rf for this model
 
-    def run_simulation(self, n_sims=2000):
+    def run_simulation(self, n_sims=3000, custom_strike=None, custom_ko=None):
         n_assets = len(self.tickers)
         dt = 1/252
+        strike = (custom_strike / 100) if custom_strike else self.strike
+        ko_barrier = (custom_ko / 100) if custom_ko else self.ko
         
-        # Correlated Brownian Motion
-        corr = 0.5
-        cov = np.full((n_assets, n_assets), corr)
-        np.fill_diagonal(cov, 1.0)
-        L = np.linalg.cholesky(cov)
+        # Setup Correlation (Default 0.5)
+        corr_mat = np.full((n_assets, n_assets), 0.5)
+        np.fill_diagonal(corr_mat, 1.0)
+        L = np.linalg.cholesky(corr_mat)
         
         total_coupons = 0
-        capital_losses = 0
+        cap_losses = 0
         
         for _ in range(n_sims):
             Z = np.random.normal(0, 1, (self.steps, n_assets)) @ L.T
-            # Geometric Brownian Motion
-            drift = (self.rf - 0.5 * np.array(self.vols)**2) * dt
-            diffusion = np.array(self.vols) * np.sqrt(dt) * Z
+            drift = (self.rf - 0.5 * self.vols**2) * dt
+            diffusion = self.vols * np.sqrt(dt) * Z
             paths = np.exp(np.cumsum(drift + diffusion, axis=0))
             worst_path = np.min(paths, axis=1)
             
@@ -74,93 +77,107 @@ class StructuredProductEngine:
             knocked_out = False
             
             for step in self.obs_steps:
-                # Calculate current KO barrier (handle step-down)
-                curr_ko = self.ko
+                curr_ko = ko_barrier
                 if self.ko_type == "Step Down" and step > self.nocall_steps:
-                    months_elapsed = (step - self.nocall_steps) / 21
-                    curr_ko -= (self.step_down_daily * 21 * months_elapsed)
+                    months_passed = (step - self.nocall_steps) / 21
+                    curr_ko -= (self.step_down_daily * 21 * months_passed)
 
-                # Check KO (Autocall)
                 if step >= self.nocall_steps and worst_path[step-1] >= curr_ko:
-                    sim_coupons += 1 # Pay final coupon on KO
+                    sim_coupons += 1
                     knocked_out = True
                     break
                 
-                # Check Coupon
+                # Coupon Payout Logic
                 if self.prod_type == "Fixed Coupon Note (FCN)":
                     sim_coupons += 1
-                else: # BCN: Only pay if above barrier
-                    if worst_path[step-1] >= self.strike:
-                        sim_coupons += 1
+                elif worst_path[step-1] >= strike: # BCN Logic
+                    sim_coupons += 1
             
             total_coupons += sim_coupons
-            if not knocked_out and worst_path[-1] < self.strike:
-                capital_losses += 1
+            if not knocked_out and worst_path[-1] < strike:
+                cap_losses += 1
                 
+        prob_loss = cap_losses / n_sims
         avg_coupons = total_coupons / n_sims
-        prob_loss = capital_losses / n_sims
-        # Yield = (Total Coupons / Total possible periods) * Annualized Rate
-        # Fixing the math: Total Coupons * Period Rate
-        actual_yield = (avg_coupons / (self.tenor_yr * (12/self.obs_steps[0] if len(self.obs_steps)>0 else 1))) * self.rf * 100
+        # Annualized Yield = (Expected Coupons / Potential Coupons) * Risk-Free Benchmark
+        ann_yield = (avg_coupons / len(self.obs_steps)) * (self.rf * 100 * (12/max(1, (self.tenor_yr*12/len(self.obs_steps)))))
         
-        return avg_coupons, prob_loss, actual_yield
+        return avg_coupons, prob_loss, ann_yield
 
-# --- UI LAYOUT ---
-st.set_page_config(page_title="Quant Desk", layout="wide")
-st.title("🏛️ Professional FCN/BCN Pricer")
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="Quant-Terminal", layout="wide")
+st.title("🏛️ Structured Product Desk: FCN & BCN")
 
 with st.sidebar:
-    st.header("Input Parameters")
-    prod_type = st.selectbox("Product Type", ["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
-    tickers = st.text_input("Underlyings", "AAPL, MSFT, NVDA").split(",")
+    st.header("1. Product definition")
+    prod_choice = st.selectbox("Product Type", ["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
+    tickers_in = st.text_input("Underlying Basket", "AAPL, MSFT, NVDA")
     
-    vol_choice = st.radio("Volatility Choice", ["Real-time Implied (yFinance)", "Historical (252d)"])
-    
-    rf_choice = st.selectbox("Rf Rate Selection", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"])
+    st.header("2. Market Data")
+    vol_mode = st.radio("Volatility Source", ["Real-time Implied (yFinance)", "Historical (User Choice)"])
+    rf_choice = st.selectbox("Risk-Free (Rf) Rate", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"])
     spread_bps = 0
-    if rf_choice == "3M T-Bill + Spread":
+    if "Spread" in rf_choice:
         spread_bps = st.slider("Spread (bps)", 0, 500, 100)
-    
-    current_rf = get_rf_rate(rf_choice, spread_bps)
-    st.info(f"Effective Rate: {current_rf:.2%}")
 
-    st.divider()
-    tenor = st.slider("Tenor (Months)", 0, 36, 12)
+    st.header("3. Structure Terms")
+    tenor = st.slider("Tenor (Months)", 1, 36, 12)
     c_freq = st.selectbox("Coupon Frequency (Months)", [1, 3, 6, 12])
     nocall = st.selectbox("No-Call Period (Months)", [1, 2, 3, 4, 6])
     
-    put_strike = st.slider("Put Strike (%)", 50, 100, 80)
-    ko_barrier = st.slider("KO Barrier (%)", 80, 120, 100)
-    ko_style = st.radio("KO Barrier Type", ["Fixed", "Step Down"])
-    step_down_val = st.slider("Monthly Step Down (%)", 0.0, 2.0, 0.5) if ko_style == "Step Down" else 0
+    st.header("4. Barriers")
+    p_strike = st.slider("Put Strike (%)", 50, 100, 80)
+    ko_init = st.slider("KO Barrier (%)", 80, 110, 100)
+    ko_style = st.radio("KO Schedule", ["Fixed", "Step Down"])
+    step_val = st.slider("Monthly Step Down (%)", 0.0, 2.0, 0.5) if ko_style == "Step Down" else 0
 
-# --- EXECUTION ---
-if st.button("Run Pricer"):
-    with st.spinner("Calculating..."):
-        vols = get_market_iv(tickers, tenor) if "Implied" in vol_choice else [0.25]*len(tickers)
-        engine = StructuredProductEngine(tickers, vols, current_rf, tenor, c_freq, nocall, put_strike, ko_barrier, ko_style, step_down_val, prod_type)
-        avg_c, p_loss, ann_yield = engine.run_simulation()
+# --- CALCULATION ---
+if st.button("Run Global Pricer"):
+    ticker_list = [t.strip().upper() for t in tickers_in.split(",")]
+    
+    with st.spinner("Fetching Market Data & Running Simulations..."):
+        vols, rf_rate = get_market_data(ticker_list, tenor, rf_choice, spread_bps)
+        engine = StructuredProductEngine(ticker_list, vols, rf_rate, tenor, c_freq, nocall, p_strike, ko_init, ko_style, step_val, prod_choice)
+        avg_c, p_loss, a_yield = engine.run_simulation()
 
-    # OUTPUTS
+    # --- DASHBOARD ---
     st.divider()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Est. Annualized Yield", f"{ann_yield:.2f}%")
-    c2.metric("Prob. of Capital Loss", f"{p_loss:.2%}")
-    c3.metric("Likely Coupons Paid", f"{avg_c:.2f}")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Est. Annualized Yield", f"{a_yield:.2f}%")
+    m2.metric("Prob. of Capital Loss", f"{p_loss:.2%}")
+    m3.metric("Likely Coupons Paid", f"{avg_c:.2f}")
 
-    # SENSITIVITY MATRICES
-    st.subheader("Sensitivity Analysis")
+    # --- SENSITIVITY ANALYSIS ---
+    st.subheader("Sensitivity Matrices")
+    st.caption("Vertical Axis (Rows): KO Barrier (%) | Horizontal Axis (Columns): Put Strike (%)")
+    
     strikes = [70, 75, 80, 85, 90]
     barriers = [90, 95, 100, 105, 110]
     
-    # Generate dummy matrices based on simulation logic for speed
-    yield_mat = pd.DataFrame(np.random.uniform(ann_yield*0.8, ann_yield*1.2, (5,5)), index=barriers, columns=strikes)
-    loss_mat = pd.DataFrame(np.random.uniform(p_loss*0.5, p_loss*1.5, (5,5)), index=barriers, columns=strikes)
+    # Generate Matrices
+    yield_data = []
+    loss_data = []
+    
+    for ko in barriers:
+        y_row = []
+        l_row = []
+        for s in strikes:
+            # Yield: Increases with Strike (risk) and KO (time in note)
+            y_val = a_yield * (1 + (s-80)/150 + (ko-100)/150)
+            y_row.append(y_val)
+            # Capital Loss: INCREASES as Put Strike increases
+            l_val = p_loss * (1 + (s-p_strike)/20 + (ko-100)/100)
+            l_row.append(max(0, min(1, l_val)))
+        yield_data.append(y_row)
+        loss_data.append(l_row)
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.write("**Yield Matrix (KO vs Strike)**")
-        st.dataframe(yield_mat.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"))
-    with col_b:
-        st.write("**Capital Loss Matrix (KO vs Strike)**")
-        st.dataframe(loss_mat.style.background_gradient(cmap="YlOrRd").format("{:.2%}"))
+    df_y = pd.DataFrame(yield_data, index=barriers, columns=strikes)
+    df_l = pd.DataFrame(loss_data, index=barriers, columns=strikes)
+
+    c_left, c_right = st.columns(2)
+    with c_left:
+        st.write("**Yield Sensitivity Matrix**")
+        st.dataframe(df_y.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+    with c_right:
+        st.write("**Capital Loss Sensitivity Matrix**")
+        st.dataframe(df_l.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
