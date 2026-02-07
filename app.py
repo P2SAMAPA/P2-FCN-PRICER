@@ -1,10 +1,3 @@
-I understand—it’s incredibly frustrating when the code blocks merge into a single line, causing that SyntaxError. This happens because of a rendering conflict between the chat interface and the script's format.
-
-To solve this once and for all, I have prepared the code in a indented, vertically spaced format below. This is the full code for your app.py.
-
-🛠️ Final GitHub Source: app.py
-Copy the text below and paste it into your GitHub file. Ensure that each import at the top is on its own separate line.
-
 import streamlit as st import numpy as np import pandas as pd import yfinance as yf from scipy.optimize import brentq
 
 st.set_page_config(page_title="Institutional Derivatives Lab", layout="wide")
@@ -19,4 +12,6 @@ def run_simulation(cpn, paths, r, t, stk, ko, f_m, nc_m, mode, sd): steps, n_s, 
 
 st.title(f"🚀 {mode} Terminal")
 
-if st.button("RUN MONTE CARLO PRICING"): v, corr, d, names = get_market_data(tks) n_s, n_d = 10000, int(tenor * 252) L = np.linalg.cholesky(corr + np.eye(len(v)) * 1e-10) dt = 1/252
+if st.button("RUN MONTE CARLO PRICING"): v, corr, d, names = get_market_data(tks) n_s, n_d = 10000, int(tenor * 252) L = np.linalg.cholesky(corr + np.eye(len(v)) * 1e-10) dt = 1/252 drift = (r_val - d - 0.5 * v**2) * dt noise = np.einsum('ij,tkj->tki', L, np.random.standard_normal((n_d, n_s, len(v)))) rets = drift + (v * np.sqrt(dt)) * noise paths = np.vstack([np.ones((1, n_s, len(v)))*100, 100 * np.exp(np.cumsum(rets, axis=0))])
+
+End of Code.
