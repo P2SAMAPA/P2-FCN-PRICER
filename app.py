@@ -14,7 +14,6 @@ def get_market_data(tickers, tenor_mo, rf_choice, spread_bps, vol_mode, vol_wind
         try:
             tk = yf.Ticker(ticker)
             if vol_mode == "Real-time Implied (yFinance)":
-                # Fetch IV
                 target_date = datetime.now() + timedelta(days=tenor_mo * 30)
                 exp = tk.options
                 closest_exp = min(exp, key=lambda x: abs((datetime.strptime(x, '%Y-%m-%d') - target_date).days))
@@ -23,7 +22,7 @@ def get_market_data(tickers, tenor_mo, rf_choice, spread_bps, vol_mode, vol_wind
                 atm_option = chain.iloc[(chain['strike'] - spot).abs().argsort()[:1]]
                 ivs.append(atm_option['impliedVolatility'].values[0])
             else:
-                # Fetch Historical Vol
+                # Historical Standard Deviation
                 hist = tk.history(period=f"{vol_window}mo")['Close']
                 log_returns = np.log(hist / hist.shift(1))
                 ivs.append(log_returns.std() * np.sqrt(252))
@@ -106,7 +105,7 @@ class StructuredProductEngine:
         return (total_payout_magnitude / n_sims), prob_l, ann_yield
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="Pricer Terminal", layout="wide")
+st.set_page_config(page_title="Quant Terminal", layout="wide")
 st.title("🏦 Derivatives Pricing Terminal")
 
 tab1, tab2 = st.tabs(["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
@@ -119,32 +118,30 @@ with tab1:
     col1, col2 = st.columns([1, 3])
     with col1:
         st.header("FCN Inputs")
-        f_tickers = st.text_input("Underlyings", "AAPL, MSFT, GOOG", key="f_t")
-        f_vol_choice = st.radio("Volatility Source", ["Real-time Implied (yFinance)", "Historical Lookback"], key="f_v")
-        f_vol_window = st.selectbox("Historical Window (Months)", [3, 6, 12, 24], index=2, key="f_vw") if "Historical" in f_vol_choice else 12
-        f_rf_choice = st.selectbox("Rf Rate", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"], key="f_rf")
-        f_spread = st.slider("Spread (bps)", 0, 500, 100, key="f_s") if "Spread" in f_rf_choice else 0
-        f_tenor = st.slider("Tenor (Months)", 1, 36, 12, key="f_te")
-        f_freq = st.selectbox("Coupon Frequency (Months)", [1, 3, 6, 12], key="f_fr")
-        f_nocall = st.selectbox("No-Call Period (Months)", [1, 2, 3, 6], key="f_nc")
-        f_strike = st.slider("Put Strike (%)", 50, 100, 80, key="f_st")
+        f_t = st.text_input("Underlyings", "AAPL, MSFT, GOOG", key="f_t")
+        f_v_mode = st.radio("Vol Source", ["Real-time Implied (yFinance)", "Historical Lookback"], key="f_v")
+        f_v_win = st.selectbox("Window (Mo)", [3, 6, 12, 24], index=2, key="f_vw") if "Historical" in f_v_mode else 12
+        f_rf = st.selectbox("Rf Rate", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"], key="f_rf")
+        f_sp = st.slider("Spread (bps)", 0, 500, 100, key="f_s") if "Spread" in f_rf else 0
+        f_te = st.slider("Tenor (Months)", 1, 36, 12, key="f_te")
+        f_fr = st.selectbox("Frequency (Months)", [1, 3, 6, 12], key="f_fr")
+        f_nc = st.selectbox("No-Call (Months)", [1, 2, 3, 6], key="f_nc")
+        f_st = st.slider("Put Strike (%)", 50, 100, 80, key="f_st")
         f_ko = st.slider("KO Barrier (%)", 80, 110, 100, key="f_ko")
-        f_ko_style = st.radio("KO Schedule", ["Fixed", "Step Down"], key="f_ks")
-        f_step = st.slider("Monthly Step Down (%)", 0.0, 2.0, 0.5, key="f_sd") if f_ko_style == "Step Down" else 0
+        f_ks = st.radio("KO Schedule", ["Fixed", "Step Down"], key="f_ks")
+        f_sd = st.slider("Mo Step Down (%)", 0.0, 2.0, 0.5, key="f_sd") if f_ks == "Step Down" else 0
         run_fcn = st.button("Price FCN")
 
     with col2:
         if run_fcn:
-            vols, rf = get_market_data(f_tickers, f_tenor, f_rf_choice, f_spread, f_vol_choice, f_vol_window)
-            eng = StructuredProductEngine(f_tickers.split(","), vols, rf, f_tenor, f_freq, f_nocall, f_ko_style, f_step, "FCN")
-            avg_p, p_l, a_y = eng.run_simulation(f_strike, f_ko)
-            
+            vols, rf = get_market_data(f_t, f_te, f_rf, f_sp, f_v_mode, f_v_win)
+            eng = StructuredProductEngine(f_t.split(","), vols, rf, f_te, f_fr, f_nc, f_ks, f_sd, "FCN")
+            avg_p, p_l, a_y = eng.run_simulation(f_st, f_ko)
             st.divider()
             m1, m2, m3 = st.columns(3)
-            m1.metric("Est. Annualized Yield", f"{a_y:.2f}%")
-            m2.metric("Prob. of Capital Loss", f"{p_l:.2%}")
-            m3.metric("Likely Avg Coupon Paid", f"{avg_p:.4f}")
-
+            m1.metric("Annualized Yield", f"{a_y:.2f}%")
+            m2.metric("Prob. Capital Loss", f"{p_l:.2%}")
+            m3.metric("Avg Coupons", f"{avg_p:.4f}")
             st.subheader("Sensitivity Analysis")
             y_res = np.zeros((5,5)); l_res = np.zeros((5,5))
             prog = st.progress(0)
@@ -153,23 +150,48 @@ with tab1:
                     _, cl, cy = eng.run_simulation(sk, ko, n_sims=400)
                     y_res[i,j] = cy; l_res[i,j] = cl
                     prog.progress((i * 5 + j + 1) / 25)
-            
-            st.write("**Yield Matrix (Rows: KO, Cols: Strike)**")
+            st.write("**Yield Matrix (KO vs Strike)**")
             st.dataframe(pd.DataFrame(y_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
-            st.write("**Capital Loss Matrix**")
-            st.dataframe(pd.DataFrame(l_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
 
 # --- TAB 2: BCN ---
 with tab2:
     col1, col2 = st.columns([1, 3])
     with col1:
         st.header("BCN Inputs")
-        b_tickers = st.text_input("Underlyings", "TSLA, NVDA, AMD", key="b_t")
-        b_vol_choice = st.radio("Volatility Source", ["Real-time Implied (yFinance)", "Historical Lookback"], key="b_v")
-        b_vol_window = st.selectbox("Historical Window (Months)", [3, 6, 12, 24], index=2, key="b_vw") if "Historical" in b_vol_choice else 12
-        b_rf_choice = st.selectbox("Rf Rate", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"], key="b_rf")
-        b_spread = st.slider("Spread (bps)", 0, 500, 100, key="b_s") if "Spread" in b_rf_choice else 0
-        b_gtd = st.number_input("Guaranteed Coupon (Annual %)", 2.0, key="b_g")
-        b_bonus = st.number_input("Bonus Coupon (Annual %)", 8.0, key="b_b")
-        b_barr = st.slider("Bonus Coupon Barrier (%)", 50, 100, 85, key="b_ba")
-        b_tenor = st.slider("Tenor (Months)", 1, 36, 12, key="b_te
+        b_t = st.text_input("Underlyings", "TSLA, NVDA, AMD", key="b_t")
+        b_v_mode = st.radio("Vol Source", ["Real-time Implied (yFinance)", "Historical Lookback"], key="b_v")
+        b_v_win = st.selectbox("Window (Mo)", [3, 6, 12, 24], index=2, key="b_vw") if "Historical" in b_v_mode else 12
+        b_rf = st.selectbox("Rf Rate", ["3M T-Bill", "1Y UST", "SOFR", "3M T-Bill + Spread"], key="b_rf")
+        b_sp = st.slider("Spread (bps)", 0, 500, 100, key="b_s") if "Spread" in b_rf else 0
+        b_gtd = st.number_input("Guaranteed (%)", 2.0, key="b_g")
+        b_bon = st.number_input("Bonus (%)", 8.0, key="b_b")
+        b_bar = st.slider("Bonus Barrier (%)", 50, 100, 85, key="b_ba")
+        b_te = st.slider("Tenor (Months)", 1, 36, 12, key="b_te")
+        b_fr = st.selectbox("Frequency (Months)", [1, 3, 6, 12], key="b_fr")
+        b_nc = st.selectbox("No-Call (Months)", [1, 2, 3, 6], key="b_nc")
+        b_st = st.slider("Put Strike (%)", 50, 100, 75, key="b_st")
+        b_ko = st.slider("KO Barrier (%)", 80, 110, 100, key="b_ko")
+        b_ks = st.radio("KO Schedule", ["Fixed", "Step Down"], key="b_ks")
+        b_sd = st.slider("Mo Step Down (%)", 0.0, 2.0, 0.5, key="b_sd") if b_ks == "Step Down" else 0
+        run_bcn = st.button("Price BCN")
+
+    with col2:
+        if run_bcn:
+            vols, rf = get_market_data(b_t, b_te, b_rf, b_sp, b_v_mode, b_v_win)
+            eng_b = StructuredProductEngine(b_t.split(","), vols, rf, b_te, b_fr, b_nc, b_ks, b_sd, "BCN", b_gtd, b_bon, b_bar)
+            avg_p, p_l, a_y = eng_b.run_simulation(b_st, b_ko)
+            st.divider()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Annualized Yield", f"{a_y:.2f}%")
+            m2.metric("Prob. Capital Loss", f"{p_l:.2%}")
+            m3.metric("Exp. Payout", f"{(avg_p*100):.2f}%")
+            st.subheader("Sensitivity Analysis")
+            y_res = np.zeros((5,5)); l_res = np.zeros((5,5))
+            prog_b = st.progress(0)
+            for i, ko in enumerate(BARRIERS):
+                for j, sk in enumerate(STRIKES):
+                    _, cl, cy = eng_b.run_simulation(sk, ko, n_sims=400)
+                    y_res[i,j] = cy; l_res[i,j] = cl
+                    prog_b.progress((i * 5 + j + 1) / 25)
+            st.write("**Yield Matrix (KO vs Strike)**")
+            st.dataframe(pd.DataFrame(y_res, index=BARRIERS, columns=STRIKES).style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
