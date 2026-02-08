@@ -4,3 +4,4 @@ pandas
 yfinance
 fpdf2
 xlsxwriter
+matplotlib
