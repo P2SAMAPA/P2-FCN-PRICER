@@ -38,7 +38,6 @@ class PricingEngine:
         self.tenor_yr = tenor_mo / 12
         self.prod_type = prod_type
         self.correlation = correlation
-        # FCN specific params
         self.freq_mo = freq_mo
         self.nocall_mo = nocall_mo
         self.ko_style = ko_style
@@ -48,7 +47,6 @@ class PricingEngine:
         n_assets, dt = len(self.vols), 1/252
         strike, ko_barrier = strike_pct / 100, ko_pct / 100
         
-        # Stabilize Correlation
         safe_corr = max(0.0, min(0.99, self.correlation))
         corr_matrix = np.full((n_assets, n_assets), safe_corr)
         np.fill_diagonal(corr_matrix, 1.0)
@@ -119,27 +117,21 @@ class PricingEngine:
         fixed_coupon = ((avg_downside - avg_participation) / prob_payout) * 100 if prob_payout > 0 else 0
         return fixed_coupon, (1 - prob_payout), (avg_participation * 100)
 
-# --- EXPORT HELPERS ---
-def create_pdf(prod_name, df1, df2):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Helvetica", 'B', 16); pdf.cell(200, 10, f"{prod_name} Report", 0, 1, 'C'); pdf.ln(10)
-    pdf.set_font("Courier", '', 9); pdf.multi_cell(0, 8, df1.to_string()); pdf.ln(10)
-    pdf.multi_cell(0, 8, df2.to_string())
-    return bytes(pdf.output())
-
-def create_excel(df1, df2):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df1.to_excel(writer, sheet_name='Matrix 1')
-        df2.to_excel(writer, sheet_name='Matrix 2')
-    return output.getvalue()
-
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("Risk Configuration")
     corr_mode = st.selectbox("Correlation Method", ["Manual Slider", "Historical (Live Calc)", "Implied (Live + Buffer)"])
-    active_corr = st.slider("Manual Correlation", 0.0, 1.0, 0.6, 0.1) if corr_mode == "Manual Slider" else 0.6
+    
+    # Dynamic sidebar inputs based on selection
+    if corr_mode == "Manual Slider":
+        active_corr_input = st.slider("Manual Correlation", 0.0, 1.0, 0.6, 0.1)
+        buffer_val = 0.0
+    elif corr_mode == "Implied (Live + Buffer)":
+        buffer_val = st.slider("Correlation Buffer (+)", 0.0, 0.5, 0.2, 0.05)
+        active_corr_input = 0.0 # Placeholder, will be calculated from live data
+    else:
+        buffer_val = 0.0
+        active_corr_input = 0.0
 
 st.title("🏦 Derivatives Desk: FCN & BCN Pricer")
 tab1, tab2 = st.tabs(["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
@@ -164,7 +156,11 @@ with tab1:
         BARRIERS = [f_ko - 20, f_ko - 10, f_ko, f_ko + 10, f_ko + 20]
         with f_c2:
             v, rf, h_c = get_market_data(f_t, f_te, f_rf, f_v, f_vw)
-            final_c = active_corr if corr_mode == "Manual Slider" else (h_c if "Historical" in corr_mode else min(1.0, h_c + 0.2))
+            # Final Correlation Logic
+            if corr_mode == "Manual Slider": final_c = active_corr_input
+            elif corr_mode == "Historical (Live Calc)": final_c = h_c
+            else: final_c = min(1.0, h_c + buffer_val)
+            
             eng = PricingEngine(v, rf, f_te, "FCN", correlation=final_c, freq_mo=f_fr, nocall_mo=f_nc, ko_style=f_ks, step_down=f_sd)
             life, loss, yld = eng.run_fcn_simulation(f_st, f_ko)
             st.divider()
@@ -199,7 +195,11 @@ with tab2:
         TENORS_B = [max(1, b_te - 6), max(1, b_te - 3), b_te, b_te + 3, b_te + 6]
         with bc2:
             v_b, rf_b, h_c_b = get_market_data(b_t, b_te, b_rf, b_v, b_vw)
-            final_c = active_corr if corr_mode == "Manual Slider" else (h_c_b if "Historical" in corr_mode else min(1.0, h_c_b + 0.2))
+            # Final Correlation Logic
+            if corr_mode == "Manual Slider": final_c = active_corr_input
+            elif corr_mode == "Historical (Live Calc)": final_c = h_c_b
+            else: final_c = min(1.0, h_c_b + buffer_val)
+            
             eng_b = PricingEngine(v_b, rf_b, b_te, "BCN", correlation=final_c)
             fixed_x, prob_loss, avg_kicker = eng_b.run_bcn_simulation(b_st)
             st.divider()
