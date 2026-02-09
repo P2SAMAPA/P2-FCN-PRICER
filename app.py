@@ -168,50 +168,55 @@ class PricingEngine:
         BCN Payout = Fixed Coupon + Max(0, Worst Stock Return) if Worst > Strike
         Else = Worst Stock Return (Capital Loss)
         """
+       def run_bcn_simulation(self, strike_pct, n_sims=2000):
         n_assets = len(self.vols)
-        dt = self.tenor_yr # Maturity only
+        dt = self.tenor_yr 
         strike = strike_pct / 100
         
-        # Correlation Matrix
-        corr_matrix = np.full((n_assets, n_assets), self.correlation)
+        # --- FIX: Ensure correlation is mathematically valid ---
+        # 1. Clip the correlation to a max of 0.99 (never 1.0 or higher)
+        safe_corr = max(0.0, min(0.99, self.correlation))
+        
+        # 2. Build the matrix
+        corr_matrix = np.full((n_assets, n_assets), safe_corr)
         np.fill_diagonal(corr_matrix, 1.0)
-        L = np.linalg.cholesky(corr_matrix)
+        
+        # 3. Add a tiny 'epsilon' to the diagonal for numerical stability
+        corr_matrix += np.eye(n_assets) * 1e-9
+        
+        try:
+            L = np.linalg.cholesky(corr_matrix)
+        except np.linalg.LinAlgError:
+            # Fallback if matrix is still singular: use independent assets
+            L = np.eye(n_assets) 
         
         total_upside_participation = 0
         total_downside_loss = 0
         prob_above_strike = 0
         
         for _ in range(n_sims):
-            # Generate terminal prices
             Z = np.random.normal(0, 1, n_assets) @ L.T
-            # S_T = S_0 * exp((r - 0.5*sigma^2)T + sigma*sqrt(T)*Z)
+            # Terminal prices for BCN (Maturity only)
             terminal_prices = np.exp((self.rf - 0.5 * self.vols**2) * self.tenor_yr + self.vols * np.sqrt(self.tenor_yr) * Z)
             worst_performance = np.min(terminal_prices)
             
             if worst_performance >= strike:
                 prob_above_strike += 1
-                # Participation is the equity return (e.g., 1.30 - 1.00 = 0.30)
                 equity_return = max(0, worst_performance - 1.0)
                 total_upside_participation += equity_return
             else:
-                # Capital loss (e.g., 0.70 - 1.00 = -0.30)
                 total_downside_loss += (1.0 - worst_performance)
 
-        # Solving for X where: PV(Fixed Coupon * Prob + Participation) = PV(Downside Risk) + Option Premium
-        # Here we solve for the X% that sets the structure to fair value at inception
         avg_participation = total_upside_participation / n_sims
         avg_downside = total_downside_loss / n_sims
         prob_payout = prob_above_strike / n_sims
         
-        # Fair Fixed Coupon X% = (Downside_Risk - Upside_Kicker_Cost) / Prob_of_Survival
-        # Adjusted for Risk Free Rate
         if prob_payout > 0:
             fixed_coupon = ((avg_downside - avg_participation) / prob_payout) * 100
         else:
             fixed_coupon = 0
             
         return fixed_coupon, (1 - prob_payout), (avg_participation * 100)
-
 # --- BCN TAB UI ---
 with tab2:
     bc1, bc2 = st.columns([1, 3])
