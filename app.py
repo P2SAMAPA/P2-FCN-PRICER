@@ -11,22 +11,35 @@ st.set_page_config(page_title="Pricer Terminal", layout="wide")
 # --- DATA ENGINE ---
 @st.cache_data(ttl=3600)
 def get_market_data(tickers, tenor_mo, rf_choice, vol_mode, vol_window):
-    ticker_list = [t.strip().upper() for t in tickers.split(",")]
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     ivs, prices = [], pd.DataFrame()
+    
     for ticker in ticker_list:
         try:
             tk = yf.Ticker(ticker)
             hist = tk.history(period="24mo")['Close'] 
-            prices[ticker] = hist
-            if vol_mode == "Real-time Implied": 
-                ivs.append(0.32) 
+            if not hist.empty:
+                prices[ticker] = hist
+                if vol_mode == "Real-time Implied": 
+                    ivs.append(0.32) 
+                else:
+                    vol_hist = hist.tail(vol_window * 21)
+                    log_returns = np.log(vol_hist / vol_hist.shift(1))
+                    ivs.append(log_returns.std() * np.sqrt(252))
             else:
-                vol_hist = hist.tail(vol_window * 21)
-                log_returns = np.log(vol_hist / vol_hist.shift(1))
-                ivs.append(log_returns.std() * np.sqrt(252))
-        except: ivs.append(0.35)
+                ivs.append(0.35)
+        except: 
+            ivs.append(0.35)
     
-    avg_hist_corr = prices.pct_change().corr().values[np.triu_indices(len(ticker_list), k=1)].mean() if not prices.empty else 0.6
+    # --- FIX: Safety check for single ticker or empty data ---
+    if len(ticker_list) > 1 and not prices.empty:
+        corr_matrix = prices.pct_change().corr().values
+        indices = np.triu_indices(len(ticker_list), k=1)
+        corr_values = corr_matrix[indices]
+        avg_hist_corr = np.nanmean(corr_values) if len(corr_values) > 0 else 0.6
+    else:
+        avg_hist_corr = 0.0 # No correlation possible for a single asset
+        
     rf_map = {"1Y UST": 0.045, "3M T-Bill": 0.053, "SOFR": 0.051}
     return ivs, rf_map.get(rf_choice, 0.05), avg_hist_corr
 
@@ -38,6 +51,7 @@ class PricingEngine:
         self.tenor_yr = tenor_mo / 12
         self.prod_type = prod_type
         self.correlation = correlation
+        # FCN specific params
         self.freq_mo = freq_mo
         self.nocall_mo = nocall_mo
         self.ko_style = ko_style
@@ -47,6 +61,7 @@ class PricingEngine:
         n_assets, dt = len(self.vols), 1/252
         strike, ko_barrier = strike_pct / 100, ko_pct / 100
         
+        # Stabilize Correlation
         safe_corr = max(0.0, min(0.99, self.correlation))
         corr_matrix = np.full((n_assets, n_assets), safe_corr)
         np.fill_diagonal(corr_matrix, 1.0)
@@ -89,6 +104,7 @@ class PricingEngine:
         n_assets = len(self.vols)
         strike = strike_pct / 100
         
+        # Stabilize Correlation
         safe_corr = max(0.0, min(0.99, self.correlation))
         corr_matrix = np.full((n_assets, n_assets), safe_corr)
         np.fill_diagonal(corr_matrix, 1.0)
@@ -122,13 +138,12 @@ with st.sidebar:
     st.header("Risk Configuration")
     corr_mode = st.selectbox("Correlation Method", ["Manual Slider", "Historical (Live Calc)", "Implied (Live + Buffer)"])
     
-    # Dynamic sidebar inputs based on selection
     if corr_mode == "Manual Slider":
         active_corr_input = st.slider("Manual Correlation", 0.0, 1.0, 0.6, 0.1)
         buffer_val = 0.0
     elif corr_mode == "Implied (Live + Buffer)":
         buffer_val = st.slider("Correlation Buffer (+)", 0.0, 0.5, 0.2, 0.05)
-        active_corr_input = 0.0 # Placeholder, will be calculated from live data
+        active_corr_input = 0.0
     else:
         buffer_val = 0.0
         active_corr_input = 0.0
@@ -156,7 +171,6 @@ with tab1:
         BARRIERS = [f_ko - 20, f_ko - 10, f_ko, f_ko + 10, f_ko + 20]
         with f_c2:
             v, rf, h_c = get_market_data(f_t, f_te, f_rf, f_v, f_vw)
-            # Final Correlation Logic
             if corr_mode == "Manual Slider": final_c = active_corr_input
             elif corr_mode == "Historical (Live Calc)": final_c = h_c
             else: final_c = min(1.0, h_c + buffer_val)
@@ -166,6 +180,7 @@ with tab1:
             st.divider()
             m1, m2, m3 = st.columns(3)
             m1.metric("Output Yield", f"{yld:.2f}%"); m2.metric("Loss Prob", f"{loss:.2%}"); m3.metric("Exp. Life (Months)", f"{life:.2f}")
+            
             y_m, l_m = np.zeros((5,5)), np.zeros((5,5))
             p = st.progress(0)
             for i, ko in enumerate(BARRIERS):
@@ -195,7 +210,6 @@ with tab2:
         TENORS_B = [max(1, b_te - 6), max(1, b_te - 3), b_te, b_te + 3, b_te + 6]
         with bc2:
             v_b, rf_b, h_c_b = get_market_data(b_t, b_te, b_rf, b_v, b_vw)
-            # Final Correlation Logic
             if corr_mode == "Manual Slider": final_c = active_corr_input
             elif corr_mode == "Historical (Live Calc)": final_c = h_c_b
             else: final_c = min(1.0, h_c_b + buffer_val)
@@ -205,7 +219,9 @@ with tab2:
             st.divider()
             m1, m2, m3 = st.columns(3)
             m1.metric("Affordable Fixed Coupon (X)", f"{fixed_x:.2f}%"); m2.metric("Prob. of Capital Loss", f"{prob_loss:.2%}"); m3.metric("Avg. Expected Bonus", f"{avg_kicker:.2f}%")
+            
             st.info(f"**Payout Logic:** If at {b_te} months the worst stock is > {b_st}%, you receive 100% + {fixed_x:.2f}% + Worst Stock Return. Otherwise, delivery of Worst Stock.")
+            
             res_coupon, res_loss = np.zeros((5,5)), np.zeros((5,5))
             p_bar = st.progress(0)
             for i, te in enumerate(TENORS_B):
@@ -214,8 +230,10 @@ with tab2:
                     x, p_l, _ = temp_eng.run_bcn_simulation(sk, n_sims=400)
                     res_coupon[i,j], res_loss[i,j] = x, p_l
                     p_bar.progress((i*5 + j + 1) / 25)
+            
             df_coupon = pd.DataFrame(res_coupon, index=[f"{t} Mo" for t in TENORS_B], columns=[f"{s}%" for s in STRIKES_B])
             df_loss = pd.DataFrame(res_loss, index=[f"{t} Mo" for t in TENORS_B], columns=[f"{s}%" for s in STRIKES_B])
+            
             col_a, col_b = st.columns(2)
             col_a.write("### Sensitivity: Fixed Coupon X%"); col_a.dataframe(df_coupon.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
             col_b.write("### Sensitivity: Capital Loss Prob"); col_b.dataframe(df_loss.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
