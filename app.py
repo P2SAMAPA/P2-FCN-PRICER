@@ -229,6 +229,10 @@ with tab2:
         run_bcn = st.button("Calculate BCN Coupon")
 
     if run_bcn:
+        # --- CALC DYNAMIC RANGES FOR MATRIX ---
+        STRIKES_B = [b_st - 10, b_st - 5, b_st, b_st + 5, b_st + 10]
+        TENORS_B = [max(1, b_te - 6), max(1, b_te - 3), b_te, b_te + 3, b_te + 6]
+        
         with bc2:
             v_b, rf_b, h_c_b = get_market_data(b_t, b_te, b_rf, b_v, b_vw)
             final_c = active_corr if corr_mode == "Manual Slider" else (h_c_b if "Historical" in corr_mode else min(1.0, h_c_b + 0.2))
@@ -244,17 +248,27 @@ with tab2:
             
             st.info(f"**Payout Logic:** If at {b_te} months the worst stock is > {b_st}%, you receive 100% + {fixed_x:.2f}% + Worst Stock Return. Otherwise, you receive the Worst Stock performance.")
 
-            # Sensitivity Matrix for the Fixed Coupon X%
-            st.write("### Sensitivity: Affordable Fixed Coupon X%")
-            STRIKES_B = [b_st - 10, b_st - 5, b_st, b_st + 5, b_st + 10]
-            TENORS_B = [max(1, b_te - 6), max(1, b_te - 3), b_te, b_te + 3, b_te + 6]
+            # --- SENSITIVITY MATRICES ---
+            res_coupon = np.zeros((5,5))
+            res_loss = np.zeros((5,5))
             
-            results = np.zeros((5,5))
+            p_bar = st.progress(0)
             for i, te in enumerate(TENORS_B):
                 for j, sk in enumerate(STRIKES_B):
                     temp_eng = PricingEngine(v_b, rf_b, te, "BCN", correlation=final_c)
-                    x, _, _ = temp_eng.run_bcn_simulation(sk, n_sims=500)
-                    results[i,j] = x
+                    x, p_l, _ = temp_eng.run_bcn_simulation(sk, n_sims=400) # Balanced sims for speed
+                    res_coupon[i,j] = x
+                    res_loss[i,j] = p_l
+                    p_bar.progress((i*5 + j + 1) / 25)
             
-            df_bcn = pd.DataFrame(results, index=[f"{t} Mo" for t in TENORS_B], columns=[f"{s}%" for s in STRIKES_B])
-            st.dataframe(df_bcn.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            df_coupon = pd.DataFrame(res_coupon, index=[f"{t} Mo" for t in TENORS_B], columns=[f"{s}%" for s in STRIKES_B])
+            df_loss = pd.DataFrame(res_loss, index=[f"{t} Mo" for t in TENORS_B], columns=[f"{s}%" for s in STRIKES_B])
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.write("### Sensitivity: Fixed Coupon X%")
+                st.dataframe(df_coupon.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            
+            with col_b:
+                st.write("### Sensitivity: Capital Loss Prob")
+                st.dataframe(df_loss.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
