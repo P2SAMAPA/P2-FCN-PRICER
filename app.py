@@ -152,45 +152,109 @@ with tab1:
             st.download_button("📥 Download", create_excel(df_y, df_l) if f_fmt=="Excel" else create_pdf("FCN", df_y, df_l), f"FCN_Report.{f_fmt.lower()}", mime="application/pdf" if f_fmt=="PDF" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # --- BCN TAB ---
+# --- UPDATED PRICING ENGINE ---
+class PricingEngine:
+    def __init__(self, vols, rf, tenor_mo, prod_type, correlation=0.6):
+        self.vols = np.array(vols)
+        self.rf = rf
+        self.tenor_yr = tenor_mo / 12
+        self.prod_type = prod_type
+        self.correlation = correlation
+        self.steps = 252 # Standard trading days for path generation
+
+    def run_bcn_simulation(self, strike_pct, n_sims=2000):
+        """
+        Calculates the affordable Fixed Coupon X% for the new BCN structure.
+        BCN Payout = Fixed Coupon + Max(0, Worst Stock Return) if Worst > Strike
+        Else = Worst Stock Return (Capital Loss)
+        """
+        n_assets = len(self.vols)
+        dt = self.tenor_yr # Maturity only
+        strike = strike_pct / 100
+        
+        # Correlation Matrix
+        corr_matrix = np.full((n_assets, n_assets), self.correlation)
+        np.fill_diagonal(corr_matrix, 1.0)
+        L = np.linalg.cholesky(corr_matrix)
+        
+        total_upside_participation = 0
+        total_downside_loss = 0
+        prob_above_strike = 0
+        
+        for _ in range(n_sims):
+            # Generate terminal prices
+            Z = np.random.normal(0, 1, n_assets) @ L.T
+            # S_T = S_0 * exp((r - 0.5*sigma^2)T + sigma*sqrt(T)*Z)
+            terminal_prices = np.exp((self.rf - 0.5 * self.vols**2) * self.tenor_yr + self.vols * np.sqrt(self.tenor_yr) * Z)
+            worst_performance = np.min(terminal_prices)
+            
+            if worst_performance >= strike:
+                prob_above_strike += 1
+                # Participation is the equity return (e.g., 1.30 - 1.00 = 0.30)
+                equity_return = max(0, worst_performance - 1.0)
+                total_upside_participation += equity_return
+            else:
+                # Capital loss (e.g., 0.70 - 1.00 = -0.30)
+                total_downside_loss += (1.0 - worst_performance)
+
+        # Solving for X where: PV(Fixed Coupon * Prob + Participation) = PV(Downside Risk) + Option Premium
+        # Here we solve for the X% that sets the structure to fair value at inception
+        avg_participation = total_upside_participation / n_sims
+        avg_downside = total_downside_loss / n_sims
+        prob_payout = prob_above_strike / n_sims
+        
+        # Fair Fixed Coupon X% = (Downside_Risk - Upside_Kicker_Cost) / Prob_of_Survival
+        # Adjusted for Risk Free Rate
+        if prob_payout > 0:
+            fixed_coupon = ((avg_downside - avg_participation) / prob_payout) * 100
+        else:
+            fixed_coupon = 0
+            
+        return fixed_coupon, (1 - prob_payout), (avg_participation * 100)
+
+# --- BCN TAB UI ---
 with tab2:
     bc1, bc2 = st.columns([1, 3])
     with bc1:
-        st.header("BCN Config")
-        b_t = st.text_input("Underlyings", "TSLA, NVDA, AMD", key="bt")
+        st.header("New BCN Config")
+        b_t = st.text_input("Underlyings", "AAPL, MSFT, GOOG", key="bt")
         b_v = st.radio("Vol Source", ["Real-time Implied", "Historical"], key="bv")
         b_vw = 12
         if b_v == "Historical":
             b_vw = st.selectbox("Lookback (Mo)", [3, 6, 12, 24], index=2, key="bvw")
+        
         b_rf = st.selectbox("Rf Rate", ["1Y UST", "3M T-Bill", "SOFR"], key="brf")
-        b_gtd, b_bon = st.number_input("Guaranteed (%)", value=2.0, key="bgtd"), st.number_input("Bonus (%)", value=8.0, key="bbon")
-        b_bar = st.slider("Bonus Barrier (%)", 50, 100, 85, key="bbar")
-        b_te, b_fr = st.slider("Tenor (Mo)", 1, 36, 12, key="bte"), st.selectbox("Frequency (Mo)", [1, 3, 6], key="bfr")
-        b_nc = st.selectbox("No-Call (Mo)", [1, 3, 6], key="bnc")
-        b_st = st.slider("Put Strike (%)", 10, 100, 75, key="bst")
-        b_ko = st.slider("KO Barrier (%)", 50, 150, 100, key="bko")
-        run_bcn = st.button("Calculate BCN")
+        b_te = st.slider("Tenor (Mo)", 1, 24, 12, key="bte")
+        b_st = st.slider("Put Strike (%)", 50, 100, 85, key="bst")
+        run_bcn = st.button("Calculate BCN Coupon")
 
     if run_bcn:
-        # --- CALC DYNAMIC RANGES FOR MATRIX ---
-        STRIKES_B = [b_st - 20, b_st - 10, b_st, b_st + 10, b_st + 20]
-        BARRIERS_B = [b_ko - 20, b_ko - 10, b_ko, b_ko + 10, b_ko + 20]
-        
         with bc2:
-            v, rf, h_c = get_market_data(b_t, b_te, b_rf, b_v, b_vw)
-            final_c = active_corr if corr_mode == "Manual Slider" else (h_c if "Historical" in corr_mode else min(1.0, h_c + 0.2))
-            eng_b = PricingEngine(v, rf, b_te, b_fr, b_nc, "Fixed", 0, "BCN", correlation=final_c, gtd_rate=b_gtd, bonus_rate=b_bon, bonus_barr=b_bar)
-            life, loss, yld = eng_b.run_simulation(b_st, b_ko)
-            st.divider()
+            v_b, rf_b, h_c_b = get_market_data(b_t, b_te, b_rf, b_v, b_vw)
+            final_c = active_corr if corr_mode == "Manual Slider" else (h_c_b if "Historical" in corr_mode else min(1.0, h_c_b + 0.2))
+            
+            eng_b = PricingEngine(v_b, rf_b, b_te, "BCN", correlation=final_c)
+            fixed_x, prob_loss, avg_kicker = eng_b.run_bcn_simulation(b_st)
+            
+            st.subheader("Note Valuation (at Maturity)")
             m1, m2, m3 = st.columns(3)
-            m1.metric("Portfolio Yield", f"{yld:.2f}%"); m2.metric("Loss Prob", f"{loss:.2%}"); m3.metric("Exp. Life (Months)", f"{life:.2f}")
-            y_m, l_m = np.zeros((5,5)), np.zeros((5,5))
-            p_b = st.progress(0)
-            for i, ko in enumerate(BARRIERS_B):
+            m1.metric("Affordable Fixed Coupon (X)", f"{fixed_x:.2f}%")
+            m2.metric("Prob. of Capital Loss", f"{prob_loss:.2%}")
+            m3.metric("Avg. Expected Bonus", f"{avg_kicker:.2f}%")
+            
+            st.info(f"**Payout Logic:** If at {b_te} months the worst stock is > {b_st}%, you receive 100% + {fixed_x:.2f}% + Worst Stock Return. Otherwise, you receive the Worst Stock performance.")
+
+            # Sensitivity Matrix for the Fixed Coupon X%
+            st.write("### Sensitivity: Affordable Fixed Coupon X%")
+            STRIKES_B = [b_st - 10, b_st - 5, b_st, b_st + 5, b_st + 10]
+            TENORS_B = [max(1, b_te - 6), max(1, b_te - 3), b_te, b_te + 3, b_te + 6]
+            
+            results = np.zeros((5,5))
+            for i, te in enumerate(TENORS_B):
                 for j, sk in enumerate(STRIKES_B):
-                    l_val, ls, y = eng_b.run_simulation(sk, ko, n_sims=200)
-                    y_m[i,j], l_m[i,j] = y, ls
-                    p_b.progress((i*5+j+1)/25)
-            df_yb, df_lb = pd.DataFrame(y_m, index=BARRIERS_B, columns=STRIKES_B), pd.DataFrame(l_m, index=BARRIERS_B, columns=STRIKES_B)
-            cc, cd = st.columns(2)
-            cc.write("**Yield Matrix**"); cc.dataframe(df_yb.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
-            cd.write("**Loss Matrix**"); cd.dataframe(df_lb.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+                    temp_eng = PricingEngine(v_b, rf_b, te, "BCN", correlation=final_c)
+                    x, _, _ = temp_eng.run_bcn_simulation(sk, n_sims=500)
+                    results[i,j] = x
+            
+            df_bcn = pd.DataFrame(results, index=[f"{t} Mo" for t in TENORS_B], columns=[f"{s}%" for s in STRIKES_B])
+            st.dataframe(df_bcn.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
