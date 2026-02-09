@@ -16,13 +16,11 @@ def get_market_data(tickers, tenor_mo, rf_choice, vol_mode, vol_window):
     for ticker in ticker_list:
         try:
             tk = yf.Ticker(ticker)
-            # Fetch history even if not using it for vol, to calculate correlation
             hist = tk.history(period="24mo")['Close'] 
             prices[ticker] = hist
             if vol_mode == "Real-time Implied": 
                 ivs.append(0.32) 
             else:
-                # Use specific lookback for historical vol
                 vol_hist = hist.tail(vol_window * 21)
                 log_returns = np.log(vol_hist / vol_hist.shift(1))
                 ivs.append(log_returns.std() * np.sqrt(252))
@@ -106,7 +104,6 @@ with st.sidebar:
 
 st.title("🏦 Derivatives Desk: FCN & BCN Pricer")
 tab1, tab2 = st.tabs(["Fixed Coupon Note (FCN)", "Bonus Coupon Note (BCN)"])
-STRIKES, BARRIERS = [70, 75, 80, 85, 90], [90, 100, 110, 130, 150]
 
 # --- FCN TAB ---
 with tab1:
@@ -115,20 +112,23 @@ with tab1:
         st.header("FCN Config")
         f_t = st.text_input("Underlyings", "AAPL, MSFT, GOOG", key="ft")
         f_v = st.radio("Vol Source", ["Real-time Implied", "Historical"], key="fv")
-        
-        # --- THE FIX: Conditional Lookback ---
         f_vw = 12
         if f_v == "Historical":
             f_vw = st.selectbox("Lookback (Mo)", [3, 6, 12, 24], index=2, key="fvw")
-            
         f_rf = st.selectbox("Rf Rate", ["1Y UST", "3M T-Bill", "SOFR"], key="frf")
         f_te, f_fr, f_nc = st.slider("Tenor (Mo)", 1, 36, 12, key="fte"), st.selectbox("Frequency (Mo)", [1, 3, 6], key="ffr"), st.selectbox("No-Call (Mo)", [1, 3, 6], key="fnc")
-        f_st, f_ko, f_ks = st.slider("Strike (%)", 50, 100, 80, key="fst"), st.slider("KO Barrier (%)", 80, 150, 100, key="fko"), st.radio("KO Schedule", ["Fixed", "Step Down"], key="fks")
+        f_st = st.slider("Strike (%)", 10, 100, 80, key="fst")
+        f_ko = st.slider("KO Barrier (%)", 50, 150, 100, key="fko")
+        f_ks = st.radio("KO Schedule", ["Fixed", "Step Down"], key="fks")
         f_sd = st.slider("Mo Step Down (%)", 0.0, 2.0, 0.5, key="fsd") if f_ks == "Step Down" else 0
         f_fmt = st.selectbox("Export Format", ["Excel", "PDF"], key="ffmt")
         run_fcn = st.button("Calculate Yield")
 
     if run_fcn:
+        # --- CALC DYNAMIC RANGES FOR MATRIX ---
+        STRIKES = [f_st - 20, f_st - 10, f_st, f_st + 10, f_st + 20]
+        BARRIERS = [f_ko - 20, f_ko - 10, f_ko, f_ko + 10, f_ko + 20]
+        
         with f_c2:
             v, rf, h_c = get_market_data(f_t, f_te, f_rf, f_v, f_vw)
             final_c = active_corr if corr_mode == "Manual Slider" else (h_c if "Historical" in corr_mode else min(1.0, h_c + 0.2))
@@ -137,14 +137,15 @@ with tab1:
             st.divider()
             m1, m2, m3 = st.columns(3)
             m1.metric("Output Yield", f"{yld:.2f}%"); m2.metric("Loss Prob", f"{loss:.2%}"); m3.metric("Exp. Life (Months)", f"{life:.2f}")
+            
             y_m, l_m = np.zeros((5,5)), np.zeros((5,5))
             p = st.progress(0)
             for i, ko in enumerate(BARRIERS):
                 for j, sk in enumerate(STRIKES):
-                    l_val, ls, y = eng.run_simulation(sk, ko, n_sims=200) # Slightly fewer sims for speed in matrix
+                    l_val, ls, y = eng.run_simulation(sk, ko, n_sims=200)
                     y_m[i,j], l_m[i,j] = y, ls
                     p.progress((i*5+j+1)/25)
-            df_y, df_l = pd.DataFrame(y_m, BARRIERS, STRIKES), pd.DataFrame(l_m, BARRIERS, STRIKES)
+            df_y, df_l = pd.DataFrame(y_m, index=BARRIERS, columns=STRIKES), pd.DataFrame(l_m, index=BARRIERS, columns=STRIKES)
             ca, cb = st.columns(2)
             ca.write("**Yield Matrix**"); ca.dataframe(df_y.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
             cb.write("**Loss Matrix**"); cb.dataframe(df_l.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
@@ -157,20 +158,23 @@ with tab2:
         st.header("BCN Config")
         b_t = st.text_input("Underlyings", "TSLA, NVDA, AMD", key="bt")
         b_v = st.radio("Vol Source", ["Real-time Implied", "Historical"], key="bv")
-        
-        # --- THE FIX: Conditional Lookback ---
         b_vw = 12
         if b_v == "Historical":
             b_vw = st.selectbox("Lookback (Mo)", [3, 6, 12, 24], index=2, key="bvw")
-            
         b_rf = st.selectbox("Rf Rate", ["1Y UST", "3M T-Bill", "SOFR"], key="brf")
         b_gtd, b_bon = st.number_input("Guaranteed (%)", value=2.0, key="bgtd"), st.number_input("Bonus (%)", value=8.0, key="bbon")
         b_bar = st.slider("Bonus Barrier (%)", 50, 100, 85, key="bbar")
         b_te, b_fr = st.slider("Tenor (Mo)", 1, 36, 12, key="bte"), st.selectbox("Frequency (Mo)", [1, 3, 6], key="bfr")
-        b_nc, b_st, b_ko = st.selectbox("No-Call (Mo)", [1, 3, 6], key="bnc"), st.slider("Put Strike (%)", 50, 100, 75, key="bst"), st.slider("KO Barrier (%)", 80, 150, 100, key="bko")
+        b_nc = st.selectbox("No-Call (Mo)", [1, 3, 6], key="bnc")
+        b_st = st.slider("Put Strike (%)", 10, 100, 75, key="bst")
+        b_ko = st.slider("KO Barrier (%)", 50, 150, 100, key="bko")
         run_bcn = st.button("Calculate BCN")
 
     if run_bcn:
+        # --- CALC DYNAMIC RANGES FOR MATRIX ---
+        STRIKES_B = [b_st - 20, b_st - 10, b_st, b_st + 10, b_st + 20]
+        BARRIERS_B = [b_ko - 20, b_ko - 10, b_ko, b_ko + 10, b_ko + 20]
+        
         with bc2:
             v, rf, h_c = get_market_data(b_t, b_te, b_rf, b_v, b_vw)
             final_c = active_corr if corr_mode == "Manual Slider" else (h_c if "Historical" in corr_mode else min(1.0, h_c + 0.2))
@@ -181,12 +185,12 @@ with tab2:
             m1.metric("Portfolio Yield", f"{yld:.2f}%"); m2.metric("Loss Prob", f"{loss:.2%}"); m3.metric("Exp. Life (Months)", f"{life:.2f}")
             y_m, l_m = np.zeros((5,5)), np.zeros((5,5))
             p_b = st.progress(0)
-            for i, ko in enumerate(BARRIERS):
-                for j, sk in enumerate(STRIKES):
+            for i, ko in enumerate(BARRIERS_B):
+                for j, sk in enumerate(STRIKES_B):
                     l_val, ls, y = eng_b.run_simulation(sk, ko, n_sims=200)
                     y_m[i,j], l_m[i,j] = y, ls
                     p_b.progress((i*5+j+1)/25)
-            df_yb, df_lb = pd.DataFrame(y_m, BARRIERS, STRIKES), pd.DataFrame(l_m, BARRIERS, STRIKES)
+            df_yb, df_lb = pd.DataFrame(y_m, index=BARRIERS_B, columns=STRIKES_B), pd.DataFrame(l_m, index=BARRIERS_B, columns=STRIKES_B)
             cc, cd = st.columns(2)
             cc.write("**Yield Matrix**"); cc.dataframe(df_yb.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
             cd.write("**Loss Matrix**"); cd.dataframe(df_lb.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
