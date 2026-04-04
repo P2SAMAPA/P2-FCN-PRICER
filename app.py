@@ -160,7 +160,7 @@ with tab1:
         f_v = st.radio("Vol Source", ["Real-time Implied", "Historical"], key="fv")
         f_vw = st.selectbox("Lookback (Mo)", [3, 6, 12, 24], index=2, key="fvw") if f_v == "Historical" else 12
         f_rf = st.selectbox("Rf Rate", ["1Y UST", "3M T-Bill", "SOFR"], key="frf")
-        f_te, f_fr, f_nc = st.slider("Tenor (Mo)", 1, 36, 12, key="fte"), st.selectbox("Frequency (Mo)", [1, 3, 6], key="ffr"), st.selectbox("No-Call (Mo)", [1, 3, 6], key="fnc")
+        f_te, f_fr, f_nc = st.slider("Tenor (Mo)", 1, 36, 12, key="fte"), st.selectbox("Frequency (Mo)", [1, 3, 6, 12], key="ffr"), st.selectbox("No-Call (Mo)", [1, 3, 6], key="fnc")
         f_st, f_ko = st.slider("Strike (%)", 10, 100, 80, key="fst"), st.slider("KO Barrier (%)", 50, 150, 100, key="fko")
         f_ks = st.radio("KO Schedule", ["Fixed", "Step Down"], key="fks")
         f_sd = st.slider("Mo Step Down (%)", 0.0, 2.0, 0.5, key="fsd") if f_ks == "Step Down" else 0
