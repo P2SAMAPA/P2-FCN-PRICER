@@ -2,6 +2,3 @@ streamlit
 numpy
 pandas
 yfinance
-fpdf2
-xlsxwriter
-matplotlib
