@@ -2,8 +2,6 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import io
-from fpdf import FPDF
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="Pricer Terminal", layout="wide")
@@ -11,37 +9,60 @@ st.set_page_config(page_title="Pricer Terminal", layout="wide")
 # --- DATA ENGINE ---
 @st.cache_data(ttl=3600)
 def get_market_data(tickers, tenor_mo, rf_choice, vol_mode, vol_window):
+    """
+    Pulls price history / vol / correlation for a comma-separated ticker string.
+    Returns (ivs, rf, avg_hist_corr, failed_tickers).
+    """
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     ivs, prices = [], pd.DataFrame()
-    
+    failed_tickers = []
+
     for ticker in ticker_list:
         try:
             tk = yf.Ticker(ticker)
-            hist = tk.history(period="24mo")['Close'] 
-            if not hist.empty:
+            hist = tk.history(period="24mo")['Close']
+            if hist is not None and not hist.empty:
                 prices[ticker] = hist
-                if vol_mode == "Real-time Implied": 
-                    ivs.append(0.32) 
+                if vol_mode == "Real-time Implied":
+                    ivs.append(0.32)
                 else:
                     vol_hist = hist.tail(vol_window * 21)
-                    log_returns = np.log(vol_hist / vol_hist.shift(1))
-                    ivs.append(log_returns.std() * np.sqrt(252))
+                    # Need at least a few data points to get a meaningful stdev
+                    if len(vol_hist) < 5:
+                        ivs.append(0.35)
+                        failed_tickers.append(ticker)
+                    else:
+                        log_returns = np.log(vol_hist / vol_hist.shift(1))
+                        vol = log_returns.std() * np.sqrt(252)
+                        ivs.append(vol if pd.notna(vol) and vol > 0 else 0.35)
             else:
                 ivs.append(0.35)
-        except: 
+                failed_tickers.append(ticker)
+        except Exception:
+            # yfinance can fail for many reasons (bad ticker, rate limiting,
+            # network hiccups on Streamlit Cloud) -- fall back gracefully
+            # instead of blowing up the whole app.
             ivs.append(0.35)
-    
-    # --- FIX: Safety check for single ticker or empty data ---
-    if len(ticker_list) > 1 and not prices.empty:
+            failed_tickers.append(ticker)
+
+    # --- FIX: size the correlation matrix off the tickers that ACTUALLY
+    # returned data (prices.shape[1]), not off the raw requested list
+    # (len(ticker_list)). Those two numbers can differ whenever a ticker
+    # fails to fetch, which is what was causing the IndexError. ---
+    n_ok = prices.shape[1]
+    if n_ok > 1:
         corr_matrix = prices.pct_change().corr().values
-        indices = np.triu_indices(len(ticker_list), k=1)
+        indices = np.triu_indices(n_ok, k=1)
         corr_values = corr_matrix[indices]
         avg_hist_corr = np.nanmean(corr_values) if len(corr_values) > 0 else 0.6
+        if pd.isna(avg_hist_corr):
+            avg_hist_corr = 0.6
     else:
-        avg_hist_corr = 0.0 # No correlation possible for a single asset
-        
+        avg_hist_corr = 0.0  # 0 or 1 usable series -> no correlation possible
+
     rf_map = {"1Y UST": 0.045, "3M T-Bill": 0.053, "SOFR": 0.051}
-    return ivs, rf_map.get(rf_choice, 0.05), avg_hist_corr
+    return ivs, rf_map.get(rf_choice, 0.05), avg_hist_corr, failed_tickers
+
 
 # --- PRICING ENGINE ---
 class PricingEngine:
@@ -57,43 +78,59 @@ class PricingEngine:
         self.ko_style = ko_style
         self.step_down_daily = (step_down / 100) / 21
 
-    def run_fcn_simulation(self, strike_pct, ko_pct, n_sims=1000):
-        n_assets, dt = len(self.vols), 1/252
-        strike, ko_barrier = strike_pct / 100, ko_pct / 100
-        
-        # Stabilize Correlation
+    def _safe_cholesky(self, n_assets):
+        """Builds a stable correlation matrix and Cholesky factor, with a
+        graceful fallback to an identity matrix if decomposition fails
+        (can happen with high correlation + many assets)."""
         safe_corr = max(0.0, min(0.99, self.correlation))
         corr_matrix = np.full((n_assets, n_assets), safe_corr)
         np.fill_diagonal(corr_matrix, 1.0)
         corr_matrix += np.eye(n_assets) * 1e-9
-        L = np.linalg.cholesky(corr_matrix)
-        
-        steps = int(self.tenor_yr * 252)
+        try:
+            return np.linalg.cholesky(corr_matrix)
+        except np.linalg.LinAlgError:
+            return np.eye(n_assets)
+
+    def run_fcn_simulation(self, strike_pct, ko_pct, n_sims=1000):
+        n_assets = len(self.vols)
+        if n_assets == 0:
+            raise ValueError("No valid underlyings with market data -- check tickers.")
+
+        dt = 1 / 252
+        strike, ko_barrier = strike_pct / 100, ko_pct / 100
+
+        L = self._safe_cholesky(n_assets)
+
+        steps = max(1, int(self.tenor_yr * 252))
         obs_freq = max(1, int((self.freq_mo / 12) * 252))
         obs_steps = np.arange(obs_freq, steps + 1, obs_freq)
+        if len(obs_steps) == 0:
+            obs_steps = np.array([steps])
         nocall_steps = int((self.nocall_mo / 12) * 252)
-        
+
         total_life_months, total_profit, loss_freq = 0, 0, 0
+
         for _ in range(n_sims):
             Z = np.random.normal(0, 1, (steps, n_assets)) @ L.T
-            paths = np.exp(np.cumsum((self.rf - 0.5 * self.vols**2) * (1/252) + self.vols * np.sqrt(1/252) * Z, axis=0))
+            paths = np.exp(np.cumsum((self.rf - 0.5 * self.vols**2) * dt + self.vols * np.sqrt(dt) * Z, axis=0))
             worst_path = np.min(paths, axis=1)
+
             sim_life_periods, knocked_out = len(obs_steps), False
-            
             for i, step in enumerate(obs_steps):
                 curr_ko = ko_barrier
                 if self.ko_style == "Step Down" and step > nocall_steps:
                     curr_ko -= (self.step_down_daily * (step - nocall_steps))
-                if step >= nocall_steps and worst_path[step-1] >= curr_ko:
+
+                if step >= nocall_steps and worst_path[step - 1] >= curr_ko:
                     knocked_out = True
                     sim_life_periods = i + 1
                     break
-            
+
             final_p = 1.0
             if not knocked_out and worst_path[-1] < strike:
                 loss_freq += 1
                 final_p = worst_path[-1]
-            
+
             total_profit += (1.0 - final_p)
             total_life_months += (sim_life_periods * self.freq_mo)
 
@@ -102,25 +139,19 @@ class PricingEngine:
 
     def run_bcn_simulation(self, strike_pct, n_sims=2000):
         n_assets = len(self.vols)
+        if n_assets == 0:
+            raise ValueError("No valid underlyings with market data -- check tickers.")
+
         strike = strike_pct / 100
-        
-        # Stabilize Correlation
-        safe_corr = max(0.0, min(0.99, self.correlation))
-        corr_matrix = np.full((n_assets, n_assets), safe_corr)
-        np.fill_diagonal(corr_matrix, 1.0)
-        corr_matrix += np.eye(n_assets) * 1e-9
-        
-        try:
-            L = np.linalg.cholesky(corr_matrix)
-        except np.linalg.LinAlgError:
-            L = np.eye(n_assets)
-        
+        L = self._safe_cholesky(n_assets)
+
         total_upside_participation, total_downside_loss, prob_above_strike = 0, 0, 0
+
         for _ in range(n_sims):
             Z = np.random.normal(0, 1, n_assets) @ L.T
             terminal_prices = np.exp((self.rf - 0.5 * self.vols**2) * self.tenor_yr + self.vols * np.sqrt(self.tenor_yr) * Z)
             worst_performance = np.min(terminal_prices)
-            
+
             if worst_performance >= strike:
                 prob_above_strike += 1
                 total_upside_participation += max(0, worst_performance - 1.0)
@@ -133,11 +164,11 @@ class PricingEngine:
         fixed_coupon = ((avg_downside - avg_participation) / prob_payout) * 100 if prob_payout > 0 else 0
         return fixed_coupon, (1 - prob_payout), (avg_participation * 100)
 
+
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("Risk Configuration")
     corr_mode = st.selectbox("Correlation Method", ["Manual Slider", "Historical (Live Calc)", "Implied (Live + Buffer)"])
-    
     if corr_mode == "Manual Slider":
         active_corr_input = st.slider("Manual Correlation", 0.0, 1.0, 0.6, 0.1)
         buffer_val = 0.0
@@ -167,31 +198,55 @@ with tab1:
         run_fcn = st.button("Calculate Yield")
 
     if run_fcn:
+        if not f_t.strip():
+            st.error("Please enter at least one underlying ticker.")
+            st.stop()
+
         STRIKES = [f_st - 20, f_st - 10, f_st, f_st + 10, f_st + 20]
         BARRIERS = [f_ko - 20, f_ko - 10, f_ko, f_ko + 10, f_ko + 20]
+
         with f_c2:
-            v, rf, h_c = get_market_data(f_t, f_te, f_rf, f_v, f_vw)
-            if corr_mode == "Manual Slider": final_c = active_corr_input
-            elif corr_mode == "Historical (Live Calc)": final_c = h_c
-            else: final_c = min(1.0, h_c + buffer_val)
-            
+            v, rf, h_c, failed = get_market_data(f_t, f_te, f_rf, f_v, f_vw)
+
+            if failed:
+                st.warning(f"Could not fetch clean market data for: {', '.join(failed)}. "
+                           f"Using a fallback 35% vol assumption for those names -- "
+                           f"results may be less accurate.")
+
+            if len(v) == 0:
+                st.error("No underlyings could be resolved. Check your tickers and try again.")
+                st.stop()
+
+            if corr_mode == "Manual Slider":
+                final_c = active_corr_input
+            elif corr_mode == "Historical (Live Calc)":
+                final_c = h_c
+            else:
+                final_c = min(1.0, h_c + buffer_val)
+
             eng = PricingEngine(v, rf, f_te, "FCN", correlation=final_c, freq_mo=f_fr, nocall_mo=f_nc, ko_style=f_ks, step_down=f_sd)
             life, loss, yld = eng.run_fcn_simulation(f_st, f_ko)
+
             st.divider()
             m1, m2, m3 = st.columns(3)
-            m1.metric("Output Yield", f"{yld:.2f}%"); m2.metric("Loss Prob", f"{loss:.2%}"); m3.metric("Exp. Life (Months)", f"{life:.2f}")
-            
-            y_m, l_m = np.zeros((5,5)), np.zeros((5,5))
+            m1.metric("Output Yield", f"{yld:.2f}%")
+            m2.metric("Loss Prob", f"{loss:.2%}")
+            m3.metric("Exp. Life (Months)", f"{life:.2f}")
+
+            y_m, l_m = np.zeros((5, 5)), np.zeros((5, 5))
             p = st.progress(0)
             for i, ko in enumerate(BARRIERS):
                 for j, sk in enumerate(STRIKES):
                     l_val, ls, y = eng.run_fcn_simulation(sk, ko, n_sims=300)
-                    y_m[i,j], l_m[i,j] = y, ls
-                    p.progress((i*5+j+1)/25)
+                    y_m[i, j], l_m[i, j] = y, ls
+                    p.progress((i * 5 + j + 1) / 25)
+
             df_y, df_l = pd.DataFrame(y_m, BARRIERS, STRIKES), pd.DataFrame(l_m, BARRIERS, STRIKES)
             ca, cb = st.columns(2)
-            ca.write("### Yield Matrix"); ca.dataframe(df_y.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
-            cb.write("### Loss Matrix"); cb.dataframe(df_l.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+            ca.write("### Yield Matrix")
+            ca.dataframe(df_y.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            cb.write("### Loss Matrix")
+            cb.dataframe(df_l.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
 
 # --- BCN TAB ---
 with tab2:
@@ -206,34 +261,55 @@ with tab2:
         run_bcn = st.button("Calculate BCN")
 
     if run_bcn:
+        if not b_t.strip():
+            st.error("Please enter at least one underlying ticker.")
+            st.stop()
+
         STRIKES_B = [b_st - 10, b_st - 5, b_st, b_st + 5, b_st + 10]
         TENORS_B = [max(1, b_te - 6), max(1, b_te - 3), b_te, b_te + 3, b_te + 6]
+
         with bc2:
-            v_b, rf_b, h_c_b = get_market_data(b_t, b_te, b_rf, b_v, b_vw)
-            if corr_mode == "Manual Slider": final_c = active_corr_input
-            elif corr_mode == "Historical (Live Calc)": final_c = h_c_b
-            else: final_c = min(1.0, h_c_b + buffer_val)
-            
+            v_b, rf_b, h_c_b, failed_b = get_market_data(b_t, b_te, b_rf, b_v, b_vw)
+
+            if failed_b:
+                st.warning(f"Could not fetch clean market data for: {', '.join(failed_b)}. "
+                           f"Using a fallback 35% vol assumption for those names -- "
+                           f"results may be less accurate.")
+
+            if len(v_b) == 0:
+                st.error("No underlyings could be resolved. Check your tickers and try again.")
+                st.stop()
+
+            if corr_mode == "Manual Slider":
+                final_c = active_corr_input
+            elif corr_mode == "Historical (Live Calc)":
+                final_c = h_c_b
+            else:
+                final_c = min(1.0, h_c_b + buffer_val)
+
             eng_b = PricingEngine(v_b, rf_b, b_te, "BCN", correlation=final_c)
             fixed_x, prob_loss, avg_kicker = eng_b.run_bcn_simulation(b_st)
+
             st.divider()
             m1, m2, m3 = st.columns(3)
-            m1.metric("Affordable Fixed Coupon (X)", f"{fixed_x:.2f}%"); m2.metric("Prob. of Capital Loss", f"{prob_loss:.2%}"); m3.metric("Avg. Expected Bonus", f"{avg_kicker:.2f}%")
-            
+            m1.metric("Affordable Fixed Coupon (X)", f"{fixed_x:.2f}%")
+            m2.metric("Prob. of Capital Loss", f"{prob_loss:.2%}")
+            m3.metric("Avg. Expected Bonus", f"{avg_kicker:.2f}%")
             st.info(f"**Payout Logic:** If at {b_te} months the worst stock is > {b_st}%, you receive 100% + {fixed_x:.2f}% + Worst Stock Return. Otherwise, delivery of Worst Stock.")
-            
-            res_coupon, res_loss = np.zeros((5,5)), np.zeros((5,5))
+
+            res_coupon, res_loss = np.zeros((5, 5)), np.zeros((5, 5))
             p_bar = st.progress(0)
             for i, te in enumerate(TENORS_B):
                 for j, sk in enumerate(STRIKES_B):
                     temp_eng = PricingEngine(v_b, rf_b, te, "BCN", correlation=final_c)
                     x, p_l, _ = temp_eng.run_bcn_simulation(sk, n_sims=400)
-                    res_coupon[i,j], res_loss[i,j] = x, p_l
-                    p_bar.progress((i*5 + j + 1) / 25)
-            
+                    res_coupon[i, j], res_loss[i, j] = x, p_l
+                    p_bar.progress((i * 5 + j + 1) / 25)
+
             df_coupon = pd.DataFrame(res_coupon, index=[f"{t} Mo" for t in TENORS_B], columns=[f"{s}%" for s in STRIKES_B])
             df_loss = pd.DataFrame(res_loss, index=[f"{t} Mo" for t in TENORS_B], columns=[f"{s}%" for s in STRIKES_B])
-            
             col_a, col_b = st.columns(2)
-            col_a.write("### Sensitivity: Fixed Coupon X%"); col_a.dataframe(df_coupon.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
-            col_b.write("### Sensitivity: Capital Loss Prob"); col_b.dataframe(df_loss.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
+            col_a.write("### Sensitivity: Fixed Coupon X%")
+            col_a.dataframe(df_coupon.style.background_gradient(cmap="RdYlGn").format("{:.2f}%"), use_container_width=True)
+            col_b.write("### Sensitivity: Capital Loss Prob")
+            col_b.dataframe(df_loss.style.background_gradient(cmap="YlOrRd").format("{:.2%}"), use_container_width=True)
